@@ -47,6 +47,7 @@ pub mod onboarding;
 pub mod openai;
 pub mod anthropic;
 pub mod groq;
+pub mod meeting_detection;
 pub mod openrouter;
 pub mod parakeet_engine;
 pub mod state;
@@ -71,6 +72,19 @@ static LANGUAGE_PREFERENCE: std::sync::LazyLock<StdMutex<String>> =
 #[derive(Debug, Deserialize)]
 struct RecordingArgs {
     save_path: String,
+}
+
+pub(crate) fn default_recording_save_path<R: Runtime>(app: &AppHandle<R>) -> Result<String, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to get app data dir: {error}"))?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+
+    Ok(data_dir
+        .join(format!("recording-{timestamp}.wav"))
+        .to_string_lossy()
+        .to_string())
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -417,6 +431,7 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(meeting_detection::monitor::new_state())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -424,6 +439,17 @@ pub fn run() {
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
             }
+
+            let meeting_detection_state = _app
+                .state::<meeting_detection::monitor::MeetingDetectionMonitorState>()
+                .inner()
+                .clone();
+            let app_for_meeting_detection = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                meeting_detection_state
+                    .initialize(app_for_meeting_detection)
+                    .await;
+            });
 
             // Initialize notification system with proper defaults
             log::info!("Initializing notification system...");
@@ -690,6 +716,11 @@ pub fn run() {
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,
             audio::recording_preferences::get_audio_backend_info,
+            // Meeting auto-detection commands
+            meeting_detection::commands::get_meeting_detection_settings,
+            meeting_detection::commands::set_meeting_detection_settings,
+            meeting_detection::commands::get_meeting_detection_status,
+            meeting_detection::commands::list_meeting_detection_providers,
             // Language preference commands
             set_language_preference,
             // Notification system commands

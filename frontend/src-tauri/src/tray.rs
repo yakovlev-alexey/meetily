@@ -62,25 +62,19 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 
             log::info!("Tray toggle: Stopping recording...");
 
-            // Generate save path (same as RecordingControls.tsx)
-            let data_dir = match app_clone.path().app_data_dir() {
-                Ok(dir) => dir,
+            let save_path = match crate::default_recording_save_path(&app_clone) {
+                Ok(path) => path,
                 Err(e) => {
-                    log::error!("Failed to get app data dir: {}", e);
+                    log::error!("Failed to generate recording save path: {}", e);
                     update_tray_menu_async(&app_clone).await;
                     return;
                 }
             };
 
-            let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-            let save_path = data_dir.join(format!("recording-{}.wav", timestamp));
-
             // Call Rust stop_recording command (like pause/resume pattern)
             let stop_result = crate::audio::recording_commands::stop_recording(
                 app_clone.clone(),
-                crate::audio::recording_commands::RecordingArgs {
-                    save_path: save_path.to_string_lossy().to_string(),
-                },
+                crate::audio::recording_commands::RecordingArgs { save_path },
             )
             .await;
 
@@ -158,25 +152,19 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         log::info!("Tray: Stopping recording...");
 
-        // Generate save path (same as RecordingControls.tsx)
-        let data_dir = match app_clone.path().app_data_dir() {
-            Ok(dir) => dir,
+        let save_path = match crate::default_recording_save_path(&app_clone) {
+            Ok(path) => path,
             Err(e) => {
-                log::error!("Failed to get app data dir: {}", e);
+                log::error!("Failed to generate recording save path: {}", e);
                 update_tray_menu_async(&app_clone).await;
                 return;
             }
         };
 
-        let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-        let save_path = data_dir.join(format!("recording-{}.wav", timestamp));
-
         // Call Rust stop_recording command (like pause/resume pattern)
         let stop_result = crate::audio::recording_commands::stop_recording(
             app_clone.clone(),
-            crate::audio::recording_commands::RecordingArgs {
-                save_path: save_path.to_string_lossy().to_string(),
-            },
+            crate::audio::recording_commands::RecordingArgs { save_path },
         )
         .await;
 

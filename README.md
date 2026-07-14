@@ -56,6 +56,7 @@ A privacy-first AI meeting assistant that captures, transcribes, and summarizes 
 - [Features](#features)
 - [Installation](#installation)
 - [Key Features in Action](#key-features-in-action)
+- [Automatic Meeting Detection](#automatic-meeting-detection)
 - [System Architecture](#system-architecture)
 - [For Developers](#for-developers)
 - [Meetily PRO](#meetily-pro)
@@ -100,6 +101,7 @@ Whether you're a defense consultant, enterprise executive, legal professional, o
 - **Multi-Platform:** Works on macOS, Windows, and Linux.
 - **Open Source:** Meetily is open source and free to use.
 - **Flexible AI Provider Support:** Choose from Ollama (local), Claude, Groq, OpenRouter, or use your own OpenAI-compatible endpoint.
+- **Opt-in Meeting Automation:** Detect active Zoom meetings locally on macOS and start or stop recording automatically.
 
 ## Installation
 
@@ -132,6 +134,14 @@ pnpm install
 ```
 
 ## Key Features in Action
+
+### Automatic Meeting Detection
+
+Meetily can monitor supported meeting apps locally and control recording without a cloud account or provider OAuth. The first provider detects active Zoom meetings on macOS; the provider registry is designed so other meeting apps and operating systems can be added independently.
+
+Open **Settings → Automation** to opt in, choose whether Meetily should start and stop recording automatically, and enable the available providers. Automatic stop only applies to recordings started by the detector. Manual recordings remain under manual control, and stopping an automatic recording manually suppresses restart until the detected meeting has ended.
+
+Meeting detection is disabled by default. Inform participants before recording and follow the consent laws and organizational policies that apply to your meetings.
 
 ### 🎯 Local Transcription
 
