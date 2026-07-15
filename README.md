@@ -42,6 +42,32 @@ A privacy-first AI meeting assistant that captures, transcribes, and summarizes 
 
 </div>
 
+## About This Fork
+
+This repository is a personal fork of the original
+[Zackriya-Solutions/meetily](https://github.com/Zackriya-Solutions/meetily)
+project. It preserves Meetily's local-first recording, transcription, and
+summary workflow while adding opt-in meeting automation for the Zoom desktop
+app on macOS.
+
+The fork adds:
+
+- local detection of an active Zoom meeting without Zoom OAuth, cloud APIs, or
+  meeting bots;
+- automatic recording start after a stable meeting signal;
+- automatic stop after the Zoom meeting ends, limited to recordings started by
+  the detector;
+- protection for manual workflows: manual recordings are never claimed or
+  stopped by automation, and a manually stopped automatic recording does not
+  restart during the same meeting;
+- an extensible provider registry for adding other meeting apps and operating
+  systems later.
+
+The current detector supports **Zoom on macOS only** and is disabled by default.
+After installation, open **Settings -> Automation** to enable it. Always inform
+participants before recording and follow the consent laws and organizational
+policies that apply to your meetings.
+
 ---
 
 > **Meetily PRO Upgrade Offer** - Meetily PRO is available for users who need enhanced accuracy, advanced exports, custom summary workflows, and team-ready features. Use coupon code **LAUNCH20** for **20% off** until the next Meetily Community Edition release. Speaker diarization is also planned for PRO in mid-June. [Explore Meetily PRO →](https://meetily.ai/pro/)
@@ -51,10 +77,12 @@ A privacy-first AI meeting assistant that captures, transcribes, and summarizes 
 <details>
 <summary>Table of Contents</summary>
 
+- [About This Fork](#about-this-fork)
 - [Introduction](#introduction)
 - [Why Meetily?](#why-meetily)
 - [Features](#features)
 - [Installation](#installation)
+  - [Build and Install This Fork on macOS](#build-and-install-this-fork-on-macos)
 - [Key Features in Action](#key-features-in-action)
 - [Automatic Meeting Detection](#automatic-meeting-detection)
 - [System Architecture](#system-architecture)
@@ -105,6 +133,10 @@ Whether you're a defense consultant, enterprise executive, legal professional, o
 
 ## Installation
 
+> The prebuilt packages below are upstream Meetily releases and may not contain
+> this fork's Zoom automation. To use the fork-specific feature, build the
+> `enhance/meeting-auto-detection` branch with the macOS instructions below.
+
 ### 🪟 **Windows**
 
 1. Download the latest `x64-setup.exe` from [Releases](https://github.com/Zackriya-Solutions/meeting-minutes/releases/latest)
@@ -116,6 +148,61 @@ Whether you're a defense consultant, enterprise executive, legal professional, o
 2. Open the downloaded `.dmg` file
 3. Drag **Meetily** to your Applications folder
 4. Open **Meetily** from Applications folder
+
+### Build and Install This Fork on macOS
+
+These steps are tested on Apple Silicon. The build script detects the host
+architecture and enables Metal/CoreML acceleration where supported.
+
+1. Install Xcode or the Xcode Command Line Tools, accept the license, and
+   install the build dependencies:
+
+   ```bash
+   xcode-select --install
+   sudo xcodebuild -license accept
+   brew install cmake node pnpm rust
+   ```
+
+2. Clone this fork's feature branch and install its frontend dependencies:
+
+   ```bash
+   git clone --branch enhance/meeting-auto-detection --single-branch \
+     https://github.com/yakovlev-alexey/meetily.git
+   cd meetily/frontend
+   pnpm install
+   ```
+
+3. Build the production app:
+
+   ```bash
+   TAURI_CONFIG='{"bundle":{"createUpdaterArtifacts":false}}' ./build-gpu.sh
+   ```
+
+   The local override disables updater artifact signing because the upstream
+   release private key is intentionally not included in the repository. It does
+   not disable the macOS app bundle signature.
+
+4. Open the generated bundle directory:
+
+   ```bash
+   open ../target/release/bundle/dmg
+   ```
+
+   Open the generated `meetily_*.dmg`, drag **Meetily** into **Applications**,
+   and choose **Replace** if another version is already installed. The unpacked
+   app is also available at
+   `../target/release/bundle/macos/meetily.app`.
+
+5. Launch Meetily, grant the requested microphone and system-audio permissions,
+   then open **Settings -> Automation** and enable:
+
+   - **Automatically detect meetings**
+   - **Start recording when a meeting begins**
+   - **Stop recording when the meeting ends**
+
+Meetily must be running while you join or leave a Zoom meeting. This is a local,
+ad-hoc-signed build rather than an upstream notarized release; the instructions
+do not require disabling Gatekeeper or removing quarantine metadata.
 
 ### 🐧 **Linux**
 
