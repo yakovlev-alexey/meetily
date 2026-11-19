@@ -50,6 +50,7 @@ export interface MeetingDetectionStatus {
   enabled: boolean;
   detected_provider_id: string | null;
   detected_provider_name: string | null;
+  telemost_signal: 'inactive' | 'active' | 'permission_required' | 'unavailable' | null;
   coordinator: MeetingDetectionCoordinatorStatus;
 }
 

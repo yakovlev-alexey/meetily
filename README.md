@@ -224,9 +224,11 @@ pnpm install
 
 ### Automatic Meeting Detection
 
-Meetily can monitor supported meeting apps locally and control recording without a cloud account or provider OAuth. The first provider detects active Zoom meetings on macOS; the provider registry is designed so other meeting apps and operating systems can be added independently.
+Meetily can monitor Zoom and the Yandex Telemost desktop app on macOS and control recording locally.
 
 Open **Settings → Automation** to opt in, choose whether Meetily should start and stop recording automatically, and enable the available providers. Automatic stop only applies to recordings started by the detector. Manual recordings remain under manual control, and stopping an automatic recording manually suppresses restart until the detected meeting has ended.
+
+To enable Yandex Telemost detection, turn on **Yandex Telemost** under **Meeting apps** and allow Meetily in macOS **System Settings → Privacy & Security → Accessibility**. Meetily reads the desktop call controls to detect an active meeting. If macOS temporarily prevents Meetily from reading those controls, you can still stop an ongoing recording manually.
 
 Meeting detection is disabled by default. Inform participants before recording and follow the consent laws and organizational policies that apply to your meetings.
 

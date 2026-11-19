@@ -1,6 +1,24 @@
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use super::provider::Platform;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemostSignal {
+    #[default]
+    Inactive,
+    Active,
+    PermissionRequired,
+    Unavailable,
+}
+
+impl TelemostSignal {
+    pub fn is_unavailable(self) -> bool {
+        matches!(self, Self::PermissionRequired | Self::Unavailable)
+    }
+}
 
 /// Local operating-system state shared by every meeting provider in one poll.
 ///
@@ -10,6 +28,7 @@ use super::provider::Platform;
 pub struct DetectionContext {
     platform: Platform,
     process_names: HashSet<String>,
+    pub telemost_signal: TelemostSignal,
 }
 
 impl DetectionContext {
@@ -25,6 +44,7 @@ impl DetectionContext {
                 .map(|name| normalize_process_name(name.as_ref()))
                 .filter(|name| !name.is_empty())
                 .collect(),
+            telemost_signal: TelemostSignal::Inactive,
         }
     }
 

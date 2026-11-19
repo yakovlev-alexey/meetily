@@ -7,7 +7,7 @@ use anyhow::Result;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -37,6 +37,21 @@ pub use super::transcription::TranscriptUpdate;
 
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+static RECORDING_LIFECYCLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static NEXT_RECORDING_SESSION: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_RECORDING_SESSION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn active_recording_session() -> Option<u64> {
+    let id = ACTIVE_RECORDING_SESSION.load(Ordering::SeqCst);
+    (id != 0).then_some(id)
+}
+
+fn mark_recording_started() -> u64 {
+    let id = NEXT_RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
+    ACTIVE_RECORDING_SESSION.store(id, Ordering::SeqCst);
+    IS_RECORDING.store(true, Ordering::SeqCst);
+    id
+}
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
@@ -67,14 +82,15 @@ pub struct TranscriptionStatus {
 
 /// Start recording with default devices
 pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    start_recording_with_meeting_name(app, None).await
+    start_recording_with_meeting_name(app, None).await.map(|_| ())
 }
 
 /// Start recording with default devices and optional meeting name
 pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    let _recording_guard = RECORDING_LIFECYCLE_LOCK.lock().await;
     info!(
         "Starting recording with default devices, meeting: {:?}",
         meeting_name
@@ -246,7 +262,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
-    IS_RECORDING.store(true, Ordering::SeqCst);
+    let session_id = mark_recording_started();
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
 
@@ -302,7 +318,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     info!("✅ Recording started successfully with async-first approach");
 
-    Ok(())
+    Ok(session_id)
 }
 
 /// Start recording with specific devices
@@ -321,6 +337,18 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
+    start_recording_session(app, mic_device_name, system_device_name, meeting_name)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn start_recording_session<R: Runtime>(
+    app: AppHandle<R>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
+    meeting_name: Option<String>,
+) -> Result<u64, String> {
+    let _recording_guard = RECORDING_LIFECYCLE_LOCK.lock().await;
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
@@ -417,7 +445,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
-    IS_RECORDING.store(true, Ordering::SeqCst);
+    let session_id = mark_recording_started();
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
 
@@ -476,7 +504,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     info!("✅ Recording started with custom devices using async-first approach");
 
-    Ok(())
+    Ok(session_id)
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
@@ -484,6 +512,55 @@ pub async fn stop_recording<R: Runtime>(
     app: AppHandle<R>,
     _args: RecordingArgs,
 ) -> Result<(), String> {
+    stop_recording_matching(app, None).await.map(|_| ())
+}
+
+pub(crate) async fn stop_recording_matching<R: Runtime>(
+    app: AppHandle<R>,
+    expected_session: Option<u64>,
+) -> Result<bool, String> {
+    let _recording_guard = RECORDING_LIFECYCLE_LOCK.lock().await;
+    let active_session = active_recording_session();
+    if active_session.is_none() || expected_session.is_some_and(|id| active_session != Some(id)) {
+        return Ok(false);
+    }
+
+    stop_active_recording(app.clone()).await?;
+    if let Some(session_id) = expected_session {
+        await_automatic_save(&app, session_id).await?;
+    }
+    Ok(true)
+}
+
+async fn await_automatic_save<R: Runtime>(app: &AppHandle<R>, session_id: u64) -> Result<(), String> {
+    use tauri::Listener;
+
+    // The frontend saves from shared transcript buffers. Keep new starts behind
+    // the lifecycle lock until it has finished with the previous session.
+    let (done, saved) = tokio::sync::oneshot::channel();
+    let done = Mutex::new(Some(done));
+    let session_id = session_id.to_string();
+    let expected_id = session_id.clone();
+    let listener = app.listen("automatic-recording-save-finished", move |event| {
+        if serde_json::from_str::<String>(event.payload()).ok().as_deref() == Some(expected_id.as_str()) {
+            if let Some(done) = done.lock().unwrap().take() {
+                let _ = done.send(());
+            }
+        }
+    });
+    let emitted = app.emit("recording-stop-complete", serde_json::json!({ "automatic_session_id": session_id }));
+    let result = match emitted {
+        Ok(()) => tokio::time::timeout(std::time::Duration::from_secs(90), saved)
+            .await
+            .map_err(|_| "Automatic recording save did not report completion in time".to_string())
+            .and_then(|result| result.map_err(|error| error.to_string())),
+        Err(error) => Err(format!("Failed to trigger recording post-processing: {error}")),
+    };
+    app.unlisten(listener);
+    result
+}
+
+async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
@@ -848,6 +925,7 @@ pub async fn stop_recording<R: Runtime>(
 
     // Set recording flag to false
     info!("🔍 Setting IS_RECORDING to false");
+    ACTIVE_RECORDING_SESSION.store(0, Ordering::SeqCst);
     IS_RECORDING.store(false, Ordering::SeqCst);
 
     // Step 4.5: Prepare metadata for frontend (NO database save)

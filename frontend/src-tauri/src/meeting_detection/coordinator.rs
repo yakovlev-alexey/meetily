@@ -57,6 +57,7 @@ pub enum CoordinatorAction {
     },
     Stop {
         provider_id: String,
+        session_id: u64,
     },
 }
 
@@ -66,7 +67,8 @@ pub struct CoordinatorInput<'a> {
     pub auto_start: bool,
     pub auto_stop: bool,
     pub observation: Option<&'a MeetingObservation>,
-    pub recording_active: bool,
+    pub recording_session: Option<u64>,
+    pub signal_unavailable: bool,
     pub now: Duration,
 }
 
@@ -105,6 +107,7 @@ enum State {
 pub struct MeetingCoordinator {
     config: CoordinatorConfig,
     state: State,
+    owned_session: Option<u64>,
 }
 
 impl MeetingCoordinator {
@@ -112,12 +115,48 @@ impl MeetingCoordinator {
         Self {
             config,
             state: State::Disabled,
+            owned_session: None,
         }
     }
 
     pub fn tick(&mut self, input: CoordinatorInput<'_>) -> Option<CoordinatorAction> {
         if !input.enabled {
             self.state = State::Disabled;
+            self.owned_session = None;
+            return None;
+        }
+
+        if let Some(session_id) = self.owned_session {
+            if input.recording_session != Some(session_id) {
+                let provider_id = self.status().provider_id;
+                self.owned_session = None;
+                self.state = match provider_id {
+                    Some(provider_id)
+                        if input.signal_unavailable
+                            || observation_matches(input.observation, &provider_id) =>
+                    {
+                        State::Suppressed {
+                            provider_id,
+                            reason: SuppressionReason::ManualStop,
+                        }
+                    }
+                    _ => State::Idle,
+                };
+                return None;
+            }
+        }
+
+        if input.signal_unavailable {
+            // A failed read breaks the sequence of confirmed observations.
+            match &self.state {
+                State::Confirming { .. } => self.state = State::Idle,
+                State::GracePeriod { provider_id, .. } => {
+                    self.state = State::AutoRecording {
+                        provider_id: provider_id.clone(),
+                    };
+                }
+                _ => {}
+            }
             return None;
         }
 
@@ -142,12 +181,13 @@ impl MeetingCoordinator {
         }
     }
 
-    pub fn resolve_start(&mut self, succeeded: bool) -> Result<(), &'static str> {
+    pub fn resolve_start(&mut self, session_id: Option<u64>) -> Result<(), &'static str> {
         let State::AutoStarting { provider_id, .. } = self.state.clone() else {
             return Err("no automatic start is pending");
         };
 
-        self.state = if succeeded {
+        self.owned_session = session_id;
+        self.state = if session_id.is_some() {
             State::AutoRecording { provider_id }
         } else {
             State::Suppressed {
@@ -165,6 +205,7 @@ impl MeetingCoordinator {
         };
 
         self.state = if succeeded {
+            self.owned_session = None;
             State::Idle
         } else {
             State::StopFailed { provider_id }
@@ -237,7 +278,7 @@ impl MeetingCoordinator {
 
         let observation = input.observation?;
 
-        if input.recording_active {
+        if input.recording_session.is_some() {
             self.state = State::Suppressed {
                 provider_id: observation.provider_id.clone(),
                 reason: SuppressionReason::ManualRecording,
@@ -268,7 +309,7 @@ impl MeetingCoordinator {
         provider_name: String,
         confirmations: u8,
     ) -> Option<CoordinatorAction> {
-        if input.recording_active {
+        if input.recording_session.is_some() {
             if let Some(observation) = input.observation {
                 self.state = State::Suppressed {
                     provider_id: observation.provider_id.clone(),
@@ -317,18 +358,6 @@ impl MeetingCoordinator {
         input: CoordinatorInput<'_>,
         provider_id: String,
     ) -> Option<CoordinatorAction> {
-        if !input.recording_active {
-            if observation_matches(input.observation, &provider_id) {
-                self.state = State::Suppressed {
-                    provider_id,
-                    reason: SuppressionReason::ManualStop,
-                };
-            } else {
-                self.state = State::Idle;
-            }
-            return None;
-        }
-
         if observation_matches(input.observation, &provider_id) {
             self.state = State::AutoRecording { provider_id };
             return None;
@@ -336,6 +365,7 @@ impl MeetingCoordinator {
 
         if !input.auto_stop {
             self.state = State::Idle;
+            self.owned_session = None;
             return None;
         }
 
@@ -352,18 +382,6 @@ impl MeetingCoordinator {
         provider_id: String,
         lost_at: Duration,
     ) -> Option<CoordinatorAction> {
-        if !input.recording_active {
-            if observation_matches(input.observation, &provider_id) {
-                self.state = State::Suppressed {
-                    provider_id,
-                    reason: SuppressionReason::ManualStop,
-                };
-            } else {
-                self.state = State::Idle;
-            }
-            return None;
-        }
-
         if observation_matches(input.observation, &provider_id) {
             self.state = State::AutoRecording { provider_id };
             return None;
@@ -371,14 +389,19 @@ impl MeetingCoordinator {
 
         if !input.auto_stop {
             self.state = State::Idle;
+            self.owned_session = None;
             return None;
         }
 
         if input.now.saturating_sub(lost_at) >= self.config.stop_grace_period {
+            let session_id = self.owned_session?;
             self.state = State::AutoStopping {
                 provider_id: provider_id.clone(),
             };
-            return Some(CoordinatorAction::Stop { provider_id });
+            return Some(CoordinatorAction::Stop {
+                provider_id,
+                session_id,
+            });
         }
 
         self.state = State::GracePeriod {
@@ -411,9 +434,7 @@ impl MeetingCoordinator {
         input: CoordinatorInput<'_>,
         provider_id: String,
     ) -> Option<CoordinatorAction> {
-        if !input.recording_active {
-            self.state = State::Idle;
-        } else if observation_matches(input.observation, &provider_id) {
+        if observation_matches(input.observation, &provider_id) {
             self.state = State::AutoRecording { provider_id };
         } else {
             self.state = State::StopFailed { provider_id };
@@ -473,7 +494,8 @@ mod tests {
             auto_start: true,
             auto_stop: true,
             observation,
-            recording_active,
+            recording_session: recording_active.then_some(1),
+            signal_unavailable: false,
             now: Duration::from_secs(seconds),
         }
     }
@@ -490,7 +512,7 @@ mod tests {
                 provider_name: "Zoom".to_string(),
             })
         );
-        coordinator.resolve_start(true).unwrap();
+        coordinator.resolve_start(Some(1)).unwrap();
     }
 
     #[test]
@@ -537,6 +559,7 @@ mod tests {
             coordinator.tick(input(None, true, 15)),
             Some(CoordinatorAction::Stop {
                 provider_id: "zoom".to_string(),
+                session_id: 1,
             })
         );
         assert_eq!(coordinator.status().phase, CoordinatorPhase::AutoStopping);
@@ -587,7 +610,7 @@ mod tests {
             coordinator.tick(input(Some(&observation), false, 2)),
             Some(CoordinatorAction::Start { .. })
         ));
-        coordinator.resolve_start(false).unwrap();
+        coordinator.resolve_start(None).unwrap();
 
         assert_eq!(coordinator.tick(input(Some(&observation), false, 4)), None);
         assert_eq!(
@@ -630,5 +653,44 @@ mod tests {
         assert!(coordinator.status().detector_owns_recording);
         assert_eq!(coordinator.tick(input(None, true, 20)), None);
         assert_eq!(coordinator.status().phase, CoordinatorPhase::StopFailed);
+    }
+
+    #[test]
+    fn unavailable_signal_restarts_stop_grace_period() {
+        let observation = zoom_observation();
+        let mut coordinator = MeetingCoordinator::default();
+        start_owned_recording(&mut coordinator, &observation);
+
+        coordinator.tick(input(None, true, 10));
+        let mut unreadable = input(None, true, 20);
+        unreadable.signal_unavailable = true;
+        assert_eq!(coordinator.tick(unreadable), None);
+        assert_eq!(coordinator.status().phase, CoordinatorPhase::AutoRecording);
+
+        assert_eq!(coordinator.tick(input(None, true, 22)), None);
+        assert_eq!(coordinator.tick(input(None, true, 26)), None);
+        assert!(matches!(
+            coordinator.tick(input(None, true, 27)),
+            Some(CoordinatorAction::Stop { session_id: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_manual_recording_started_between_polls_never_inherits_ownership() {
+        let observation = zoom_observation();
+        let mut coordinator = MeetingCoordinator::default();
+        start_owned_recording(&mut coordinator, &observation);
+        coordinator.tick(input(None, true, 10));
+
+        let mut replacement = input(Some(&observation), true, 16);
+        replacement.recording_session = Some(2);
+        assert_eq!(coordinator.tick(replacement), None);
+        assert!(!coordinator.status().detector_owns_recording);
+        assert_eq!(
+            coordinator.status().suppression_reason,
+            Some(SuppressionReason::ManualStop)
+        );
+        replacement.observation = None;
+        assert_eq!(coordinator.tick(replacement), None);
     }
 }

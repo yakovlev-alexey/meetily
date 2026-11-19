@@ -44,6 +44,7 @@ impl Platform {
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Process,
+    Accessibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,14 +120,16 @@ impl ProviderRegistry {
             .collect()
     }
 
-    pub fn detect_first(
+    pub fn detect(
         &self,
         context: &DetectionContext,
         settings: &MeetingDetectionSettings,
+        tracked_provider: Option<&str>,
     ) -> Option<MeetingObservation> {
         self.providers
             .iter()
             .filter(|provider| settings.is_provider_enabled(provider.id()))
+            .filter(|provider| tracked_provider.map_or(true, |id| provider.id() == id))
             .find_map(|provider| provider.observe(context))
     }
 }
@@ -145,9 +148,22 @@ mod tests {
     fn registry_exposes_backend_provider_descriptors() {
         let descriptors = ProviderRegistry::default().descriptors(Platform::Macos);
 
-        assert_eq!(descriptors.len(), 1);
-        assert_eq!(descriptors[0].id, "zoom");
-        assert!(descriptors[0].supported);
+        assert!(descriptors
+            .iter()
+            .any(|provider| provider.id == "zoom" && provider.supported));
+    }
+
+    #[test]
+    fn telemost_is_available_on_macos_and_requires_explicit_opt_in() {
+        let registry = ProviderRegistry::default();
+        let descriptors = registry.descriptors(Platform::Macos);
+        let telemost = descriptors
+            .iter()
+            .find(|provider| provider.id == "telemost")
+            .expect("the Telemost provider should be registered");
+        assert!(telemost.supported);
+        assert_eq!(telemost.supported_platforms, vec![Platform::Macos]);
+        assert!(!MeetingDetectionSettings::default().is_provider_enabled("telemost"));
     }
 
     #[test]
@@ -157,6 +173,37 @@ mod tests {
         let mut settings = MeetingDetectionSettings::default();
         settings.enabled_providers.insert("zoom".to_string(), false);
 
-        assert!(registry.detect_first(&context, &settings).is_none());
+        assert!(registry.detect(&context, &settings, None).is_none());
+    }
+
+    #[test]
+    fn parallel_zoom_call_does_not_mask_the_tracked_telemost_signal() {
+        use crate::meeting_detection::context::TelemostSignal;
+
+        let registry = ProviderRegistry::default();
+        let mut settings = MeetingDetectionSettings::default();
+        settings.enabled_providers.insert("telemost".into(), true);
+        let mut context = DetectionContext::from_process_names(Platform::Macos, ["CptHost"]);
+        context.telemost_signal = TelemostSignal::Active;
+
+        assert_eq!(
+            registry
+                .detect(&context, &settings, None)
+                .unwrap()
+                .provider_id,
+            "zoom"
+        );
+        assert_eq!(
+            registry
+                .detect(&context, &settings, Some("telemost"))
+                .unwrap()
+                .provider_id,
+            "telemost"
+        );
+
+        context.telemost_signal = TelemostSignal::Inactive;
+        assert!(registry
+            .detect(&context, &settings, Some("telemost"))
+            .is_none());
     }
 }

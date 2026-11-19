@@ -157,6 +157,14 @@ async fn start_recording<R: Runtime>(
 
 #[tauri::command]
 async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> Result<(), String> {
+    stop_recording_with_session(app, args, None).await
+}
+
+async fn stop_recording_with_session<R: Runtime>(
+    app: AppHandle<R>,
+    args: RecordingArgs,
+    expected_session: Option<u64>,
+) -> Result<(), String> {
     log_info!("Attempting to stop recording...");
 
     // Check the actual audio recording system state instead of the flag
@@ -166,15 +174,9 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
     }
 
     // Call the actual audio recording system to stop
-    match audio::recording_commands::stop_recording(
-        app.clone(),
-        audio::recording_commands::RecordingArgs {
-            save_path: args.save_path.clone(),
-        },
-    )
-    .await
-    {
-        Ok(_) => {
+    match audio::recording_commands::stop_recording_matching(app.clone(), expected_session).await {
+        Ok(false) => Ok(()),
+        Ok(true) => {
             RECORDING_FLAG.store(false, Ordering::SeqCst);
             tray::update_tray_menu(&app);
 
@@ -324,6 +326,17 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
+    start_recording_with_devices_session(app, mic_device_name, system_device_name, meeting_name)
+        .await
+        .map(|_| ())
+}
+
+async fn start_recording_with_devices_session<R: Runtime>(
+    app: AppHandle<R>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
+    meeting_name: Option<String>,
+) -> Result<u64, String> {
     log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
 
@@ -347,7 +360,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 system_device_name,
                 meeting_name
             );
-            audio::recording_commands::start_recording_with_devices_and_meeting(
+            audio::recording_commands::start_recording_session(
                 app.clone(),
                 mic_device_name,
                 system_device_name,
@@ -358,7 +371,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     };
 
     match recording_result {
-        Ok(_) => {
+        Ok(session_id) => {
             log_info!("Recording started successfully via tauri command");
 
             // Show recording started notification through NotificationManager
@@ -377,7 +390,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 );
             }
 
-            Ok(())
+            Ok(session_id)
         }
         Err(e) => {
             log_error!("Failed to start recording via tauri command: {}", e);

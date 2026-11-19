@@ -12,12 +12,19 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::notifications::commands::NotificationManagerState;
+use crate::{
+    audio::recording_commands::active_recording_session,
+    notifications::commands::NotificationManagerState,
+};
 
 use super::{
-    context::DetectionContext,
-    coordinator::{CoordinatorAction, CoordinatorInput, CoordinatorStatus, MeetingCoordinator},
+    context::{DetectionContext, TelemostSignal},
+    coordinator::{
+        CoordinatorAction, CoordinatorInput, CoordinatorPhase, CoordinatorStatus,
+        MeetingCoordinator,
+    },
     provider::{MeetingObservation, Platform, ProviderDescriptor, ProviderRegistry},
+    providers::telemost,
     settings::{self, MeetingDetectionSettings},
 };
 
@@ -28,6 +35,7 @@ pub struct MeetingDetectionStatus {
     pub enabled: bool,
     pub detected_provider_id: Option<String>,
     pub detected_provider_name: Option<String>,
+    pub telemost_signal: Option<TelemostSignal>,
     pub coordinator: CoordinatorStatus,
 }
 
@@ -56,6 +64,7 @@ impl MeetingDetectionMonitor {
             enabled: settings.enabled,
             detected_provider_id: None,
             detected_provider_name: None,
+            telemost_signal: None,
             coordinator: coordinator.status(),
         };
 
@@ -119,32 +128,60 @@ impl MeetingDetectionMonitor {
         let mut system = System::new_with_specifics(
             RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
         );
+        let mut telemost_suppressed_until_inactive = false;
 
         loop {
             let current_settings = self.settings().await;
-            let observation = if current_settings.enabled {
+            let coordinator_status = self.coordinator.lock().await.status();
+            let tracked_provider = coordinator_status.provider_id.as_deref();
+            let telemost_signal = read_telemost_signal(&current_settings).await;
+            if self.settings().await != current_settings {
+                continue;
+            }
+
+            // Keep a manually stopped Telemost call suppressed during an AX outage
+            // without preventing Zoom from starting during that outage.
+            let release_telemost = tracked_provider == Some(telemost::PROVIDER_ID)
+                && coordinator_status.phase == CoordinatorPhase::Suppressed
+                && telemost_signal.is_some_and(TelemostSignal::is_unavailable);
+            if release_telemost {
+                telemost_suppressed_until_inactive = true;
+            } else if telemost_signal.is_none() || telemost_signal == Some(TelemostSignal::Inactive)
+            {
+                telemost_suppressed_until_inactive = false;
+            }
+            let tracked_provider = tracked_provider.filter(|_| !release_telemost);
+            let enabled = current_settings.enabled
+                && tracked_provider.map_or(true, |id| current_settings.is_provider_enabled(id));
+
+            let observation = if enabled {
                 system.refresh_processes(ProcessesToUpdate::All, true);
-                let context = DetectionContext::from_process_names(
+                let mut context = DetectionContext::from_process_names(
                     Platform::current(),
                     system
                         .processes()
                         .values()
                         .map(|process| process.name().to_string_lossy().into_owned()),
                 );
-                self.registry.detect_first(&context, &current_settings)
+                if !telemost_suppressed_until_inactive {
+                    context.telemost_signal = telemost_signal.unwrap_or_default();
+                }
+                self.registry
+                    .detect(&context, &current_settings, tracked_provider)
             } else {
                 None
             };
 
-            let recording_active = crate::audio::recording_commands::is_recording().await;
             let action = {
                 let mut coordinator = self.coordinator.lock().await;
                 coordinator.tick(CoordinatorInput {
-                    enabled: current_settings.enabled,
+                    enabled,
                     auto_start: current_settings.auto_start,
                     auto_stop: current_settings.auto_stop,
                     observation: observation.as_ref(),
-                    recording_active,
+                    recording_session: active_recording_session(),
+                    signal_unavailable: tracked_provider == Some(telemost::PROVIDER_ID)
+                        && telemost_signal.is_some_and(TelemostSignal::is_unavailable),
                     now: started_at.elapsed(),
                 })
             };
@@ -153,8 +190,13 @@ impl MeetingDetectionMonitor {
                 self.execute_action(&app, action).await;
             }
 
-            self.publish_status(&app, &current_settings, observation.as_ref())
-                .await;
+            self.publish_status(
+                &app,
+                &current_settings,
+                observation.as_ref(),
+                telemost_signal,
+            )
+            .await;
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
@@ -167,19 +209,22 @@ impl MeetingDetectionMonitor {
             } => {
                 info!("Auto-starting recording for provider {provider_id}");
                 let result = start_automatic_recording(app, &provider_name).await;
-                let succeeded = result.is_ok();
+                let session_id = result.as_ref().ok().copied();
 
                 if let Err(error) = result {
                     self.report_error(app, "start", &provider_id, error).await;
                 }
 
-                if let Err(error) = self.coordinator.lock().await.resolve_start(succeeded) {
+                if let Err(error) = self.coordinator.lock().await.resolve_start(session_id) {
                     error!("Failed to resolve meeting detection start action: {error}");
                 }
             }
-            CoordinatorAction::Stop { provider_id } => {
+            CoordinatorAction::Stop {
+                provider_id,
+                session_id,
+            } => {
                 info!("Auto-stopping recording for provider {provider_id}");
-                let result = stop_automatic_recording(app).await;
+                let result = stop_automatic_recording(app, session_id).await;
                 let succeeded = result.is_ok();
 
                 if let Err(error) = result {
@@ -198,11 +243,13 @@ impl MeetingDetectionMonitor {
         app: &AppHandle<Wry>,
         settings: &MeetingDetectionSettings,
         observation: Option<&MeetingObservation>,
+        telemost_signal: Option<TelemostSignal>,
     ) {
         let status = MeetingDetectionStatus {
             enabled: settings.enabled,
             detected_provider_id: observation.map(|value| value.provider_id.clone()),
             detected_provider_name: observation.map(|value| value.provider_name.clone()),
+            telemost_signal,
             coordinator: self.coordinator.lock().await.status(),
         };
 
@@ -265,18 +312,31 @@ pub fn new_state() -> MeetingDetectionMonitorState {
 async fn start_automatic_recording(
     app: &AppHandle<Wry>,
     provider_name: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let meeting_name = format!("{provider_name} Meeting {timestamp}");
 
-    crate::start_recording_with_devices_and_meeting(app.clone(), None, None, Some(meeting_name))
-        .await
+    crate::start_recording_with_devices_session(app.clone(), None, None, Some(meeting_name)).await
 }
 
-async fn stop_automatic_recording(app: &AppHandle<Wry>) -> Result<(), String> {
+async fn stop_automatic_recording(app: &AppHandle<Wry>, session_id: u64) -> Result<(), String> {
     let save_path = crate::default_recording_save_path(app)?;
-    crate::stop_recording(app.clone(), crate::RecordingArgs { save_path }).await?;
-    app.emit("recording-stop-complete", true)
-        .map_err(|error| format!("Failed to trigger recording post-processing: {error}"))?;
-    Ok(())
+    crate::stop_recording_with_session(
+        app.clone(),
+        crate::RecordingArgs { save_path },
+        Some(session_id),
+    )
+    .await
+}
+
+async fn read_telemost_signal(_settings: &MeetingDetectionSettings) -> Option<TelemostSignal> {
+    #[cfg(target_os = "macos")]
+    if _settings.enabled && _settings.is_provider_enabled(telemost::PROVIDER_ID) {
+        return Some(
+            tokio::task::spawn_blocking(telemost::read_signal)
+                .await
+                .unwrap_or(TelemostSignal::Unavailable),
+        );
+    }
+    None
 }

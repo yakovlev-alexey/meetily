@@ -16,7 +16,7 @@ import {
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
 interface UseRecordingStopReturn {
-  handleRecordingStop: (callApi: boolean) => Promise<void>;
+  handleRecordingStop: (callApi: boolean, waitForCleanup?: boolean) => Promise<void>;
   isStopping: boolean;
   isProcessingTranscript: boolean;
   isSavingTranscript: boolean;
@@ -118,7 +118,7 @@ export function useRecordingStop(
   }, [router]);
 
   // Main recording stop handler
-  const handleRecordingStop = useCallback(async (isCallApi: boolean) => {
+  const handleRecordingStop = useCallback(async (isCallApi: boolean, waitForCleanup = false) => {
     if (recordingStoppedDataRef.current) {
       await recordingStoppedDataRef.current;
     }
@@ -336,14 +336,15 @@ export function useRecordingStop(
           });
 
           // Auto-navigate after a short delay with source parameter
-          setTimeout(() => {
-            router.push(`/meeting-details?id=${meetingId}&source=recording`);
-            clearTranscripts()
-            Analytics.trackPageView('meeting_details');
-
-            // Reset to IDLE after navigation
-            setStatus(RecordingStatus.IDLE);
-          }, 2000);
+          const navigation = new Promise<void>(resolve => {
+            setTimeout(() => {
+              router.push(`/meeting-details?id=${meetingId}&source=recording`);
+              clearTranscripts();
+              void Analytics.trackPageView('meeting_details');
+              setStatus(RecordingStatus.IDLE);
+              resolve();
+            }, 2000);
+          });
           // Track meeting completion analytics
           try {
             // Calculate meeting duration from transcript timestamps
@@ -393,6 +394,9 @@ export function useRecordingStop(
           } catch (analyticsError) {
             console.error('Failed to track meeting completion analytics:', analyticsError);
             // Don't block user flow on analytics errors
+          }
+          if (waitForCleanup) {
+            await navigation;
           }
 
         } catch (saveError) {

@@ -181,6 +181,9 @@ export function MeetingDetectionSettings() {
 
         {providers.map(provider => {
           const enabled = settings.enabled_providers[provider.id] ?? false;
+          const telemostSignal = provider.id === 'telemost' && settings.enabled && enabled
+            ? status?.telemost_signal
+            : null;
 
           return (
             <div
@@ -196,9 +199,20 @@ export function MeetingDetectionSettings() {
                       ? `Supported on this device (${supportedPlatforms(provider)})`
                       : `Available on ${supportedPlatforms(provider)}`}
                   </div>
+                  {telemostSignal === 'permission_required' && (
+                    <div className="text-sm text-amber-800 mt-1">
+                      Allow Meetily in System Settings → Privacy &amp; Security → Accessibility.
+                    </div>
+                  )}
+                  {telemostSignal === 'unavailable' && (
+                    <div className="text-sm text-amber-800 mt-1">
+                      Meetily cannot read the Telemost call state. You can stop recording manually.
+                    </div>
+                  )}
                 </div>
               </div>
               <Switch
+                aria-label={`Detect ${provider.display_name} meetings`}
                 checked={enabled}
                 onCheckedChange={providerEnabled => save({
                   ...settings,
