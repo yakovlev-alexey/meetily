@@ -13,7 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, Wry};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    audio::recording_commands::{active_recording_session, recording_start_available},
+    audio::recording_commands::{active_recording_session, recording_start_ready, RECORDING_IS_SAVING},
     notifications::commands::NotificationManagerState,
 };
 
@@ -25,7 +25,7 @@ use super::{
     },
     provider::{MeetingObservation, Platform, ProviderDescriptor, ProviderRegistry},
     providers::telemost,
-    settings::{self, MeetingDetectionSettings},
+    settings::{self, AutomationPermission, MeetingDetectionSettings, AUTOMATIC_START_DISABLED, AUTOMATIC_STOP_DISABLED},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -78,19 +78,21 @@ impl MeetingDetectionMonitor {
     }
 
     pub async fn initialize(self: &Arc<Self>, app: AppHandle<Wry>) {
+        let mut current_settings = self.settings.write().await;
         match settings::load_settings(&app).await {
             Ok(settings) => {
                 info!(
                     "Meeting detection initialized: enabled={}",
                     settings.enabled
                 );
-                *self.settings.write().await = settings;
+                *current_settings = settings;
             }
             Err(error) => {
                 error!("Failed to initialize meeting detection settings: {error}");
             }
         }
 
+        drop(current_settings);
         self.start(app);
     }
 
@@ -98,8 +100,17 @@ impl MeetingDetectionMonitor {
         self.settings.read().await.clone()
     }
 
-    pub async fn update_settings(&self, settings: MeetingDetectionSettings) {
-        *self.settings.write().await = settings;
+    pub async fn update_settings(
+        &self,
+        app: &AppHandle<Wry>,
+        settings: MeetingDetectionSettings,
+    ) -> Result<(), String> {
+        let mut current_settings = self.settings.write().await;
+        settings::save_settings(app, &settings)
+            .await
+            .map_err(|error| format!("Failed to save meeting detection settings: {error}"))?;
+        *current_settings = settings;
+        Ok(())
     }
 
     pub async fn status(&self) -> MeetingDetectionStatus {
@@ -176,12 +187,13 @@ impl MeetingDetectionMonitor {
 
             let action = {
                 let mut coordinator = self.coordinator.lock().await;
+                let recording_session = active_recording_session();
                 coordinator.tick(CoordinatorInput {
                     enabled,
-                    auto_start: current_settings.auto_start && recording_start_available(),
+                    auto_start: current_settings.auto_start && recording_start_ready(),
                     auto_stop: current_settings.auto_stop,
                     observation: observation.as_ref(),
-                    recording_session: active_recording_session(),
+                    recording_session,
                     signal_unavailable: tracked_provider == Some(telemost::PROVIDER_ID)
                         && telemost_signal.is_some_and(TelemostSignal::is_unavailable),
                     now: started_at.elapsed(),
@@ -210,7 +222,14 @@ impl MeetingDetectionMonitor {
                 provider_name,
             } => {
                 info!("Auto-starting recording for provider {provider_id}");
-                let result = start_automatic_recording(app, &provider_name).await;
+                let permission = AutomationPermission { settings: &self.settings, provider_id: &provider_id };
+                let result = start_automatic_recording(app, &provider_name, permission).await;
+                if result.as_ref().is_err_and(|error| {
+                    matches!(error.as_str(), RECORDING_IS_SAVING | AUTOMATIC_START_DISABLED)
+                }) {
+                    self.coordinator.lock().await.defer_start();
+                    return;
+                }
                 let session_id = result.as_ref().ok().copied();
 
                 if let Err(error) = result {
@@ -226,7 +245,12 @@ impl MeetingDetectionMonitor {
                 session_id,
             } => {
                 info!("Auto-stopping recording for provider {provider_id}");
-                let result = stop_automatic_recording(app, session_id).await;
+                let permission = AutomationPermission { settings: &self.settings, provider_id: &provider_id };
+                let result = stop_automatic_recording(app, session_id, permission).await;
+                if result.as_ref().is_err_and(|error| error == AUTOMATIC_STOP_DISABLED) {
+                    self.coordinator.lock().await.defer_stop();
+                    return;
+                }
                 let succeeded = result.is_ok();
 
                 if let Err(error) = result {
@@ -314,19 +338,26 @@ pub fn new_state() -> MeetingDetectionMonitorState {
 async fn start_automatic_recording(
     app: &AppHandle<Wry>,
     provider_name: &str,
+    permission: AutomationPermission<'_>,
 ) -> Result<u64, String> {
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let meeting_name = format!("{provider_name} Meeting {timestamp}");
 
-    crate::start_recording_with_devices_session(app.clone(), None, None, Some(meeting_name)).await
+    crate::start_recording_with_devices_session(app.clone(), None, None, Some(meeting_name), Some(permission))
+        .await
 }
 
-async fn stop_automatic_recording(app: &AppHandle<Wry>, session_id: u64) -> Result<(), String> {
+async fn stop_automatic_recording(
+    app: &AppHandle<Wry>,
+    session_id: u64,
+    permission: AutomationPermission<'_>,
+) -> Result<(), String> {
     let save_path = crate::default_recording_save_path(app)?;
     crate::stop_recording_with_session(
         app.clone(),
         crate::RecordingArgs { save_path },
         Some(session_id),
+        Some(permission),
     )
     .await
 }

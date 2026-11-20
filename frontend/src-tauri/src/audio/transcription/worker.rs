@@ -4,10 +4,8 @@
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
-use crate::audio::{
-    recording_saver::{RecordingTranscriptWriter, TranscriptSegment},
-    AudioChunk,
-};
+use crate::audio::AudioChunk;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,10 +43,9 @@ pub struct TranscriptUpdate {
 // have been moved to recording_commands.rs where they have access to RECORDING_MANAGER
 
 /// Optimized parallel transcription task ensuring ZERO chunk loss
-pub(crate) fn start_transcription_task<R: Runtime>(
+pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
     transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
-    transcript_writer: RecordingTranscriptWriter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
@@ -80,7 +77,7 @@ pub(crate) fn start_transcription_task<R: Runtime>(
         info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
 
         // Spawn worker tasks
-        let mut worker_handles = tokio::task::JoinSet::new();
+        let mut workers = FuturesUnordered::new();
         for worker_id in 0..NUM_WORKERS {
             let engine_clone = match &transcription_engine {
                 TranscriptionEngine::Whisper(e) => TranscriptionEngine::Whisper(e.clone()),
@@ -93,8 +90,7 @@ pub(crate) fn start_transcription_task<R: Runtime>(
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
 
-            let transcript_writer = transcript_writer.clone();
-            worker_handles.spawn(async move {
+            workers.push(async move {
                 info!("👷 Worker {} started", worker_id);
 
                 // PRE-VALIDATE model state to avoid repeated async calls per chunk
@@ -201,6 +197,15 @@ pub(crate) fn start_transcription_task<R: Runtime>(
                                         let audio_start_time = chunk_timestamp; // Already in seconds from recording start
                                         let audio_end_time = chunk_timestamp + chunk_duration;
 
+                                        // Save structured transcript segment to recording manager (only final results)
+                                        // Save ALL segments (partial and final) to ensure complete JSON
+                                        // Create structured segment with full timestamp data
+                                        // NOTE: This is now handled via the transcript-update event emission below
+                                        // The recording_commands module listens to these events and saves them
+                                        // This decouples the transcription worker from direct RECORDING_MANAGER access
+
+                                        // Emit transcript update with NEW recording-relative timestamps
+
                                         let update = TranscriptUpdate {
                                             text: transcript,
                                             timestamp: format_current_timestamp(), // Wall-clock for reference
@@ -214,17 +219,6 @@ pub(crate) fn start_transcription_task<R: Runtime>(
                                             audio_end_time,
                                             duration: chunk_duration,
                                         };
-
-                                        transcript_writer.add_transcript_segment(TranscriptSegment {
-                                            id: format!("seg_{}", update.sequence_id),
-                                            text: update.text.clone(),
-                                            audio_start_time: update.audio_start_time,
-                                            audio_end_time: update.audio_end_time,
-                                            duration: update.duration,
-                                            display_time: update.timestamp.clone(),
-                                            confidence: update.confidence,
-                                            sequence_id: update.sequence_id,
-                                        });
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
                                         {
@@ -326,41 +320,40 @@ pub(crate) fn start_transcription_task<R: Runtime>(
 
         }
 
-        // Main dispatcher: receive chunks and distribute to workers
-        let mut receiver = transcription_receiver;
-        while let Some(chunk) = receiver.recv().await {
-            let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
-            info!(
-                "📥 Dispatching chunk {} to workers (total queued: {})",
-                chunk.chunk_id, queued
-            );
+        let dispatch = async {
+            // Main dispatcher: receive chunks and distribute to workers
+            let mut receiver = transcription_receiver;
+            while let Some(chunk) = receiver.recv().await {
+                let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
+                info!(
+                    "📥 Dispatching chunk {} to workers (total queued: {})",
+                    chunk.chunk_id, queued
+                );
 
-            if let Err(_) = work_sender.send(chunk) {
-                error!("❌ Failed to send chunk to workers - this should not happen!");
-                break;
+                if let Err(_) = work_sender.send(chunk) {
+                    error!("❌ Failed to send chunk to workers - this should not happen!");
+                    break;
+                }
             }
-        }
 
-        // Signal that input is finished
-        input_finished.store(true, Ordering::SeqCst);
-        drop(work_sender); // Close the channel to signal workers
+            // Signal that input is finished
+            input_finished.store(true, Ordering::SeqCst);
+            drop(work_sender); // Close the channel to signal workers
 
-        let total_chunks_queued = chunks_queued.load(Ordering::SeqCst);
-        info!("📭 Input finished with {} total chunks queued. Waiting for all {} workers to complete...",
-              total_chunks_queued, NUM_WORKERS);
+            let total_chunks_queued = chunks_queued.load(Ordering::SeqCst);
+            info!("📭 Input finished with {} total chunks queued. Waiting for all {} workers to complete...",
+                  total_chunks_queued, NUM_WORKERS);
 
-        // Emit final chunk count to frontend
-        let _ = app.emit("transcription-queue-complete", serde_json::json!({
-            "total_chunks": total_chunks_queued,
-            "message": format!("{} chunks queued for processing - waiting for completion", total_chunks_queued)
-        }));
-
-        // Wait for all workers to complete
-        while let Some(result) = worker_handles.join_next().await {
-            if let Err(error) = result {
-                error!("Transcription worker failed: {error}");
-            }
-        }
+            // Emit final chunk count to frontend
+            let _ = app.emit("transcription-queue-complete", serde_json::json!({
+                "total_chunks": total_chunks_queued,
+                "message": format!("{} chunks queued for processing - waiting for completion", total_chunks_queued)
+            }));
+        };
+        let transcribe = async { while workers.next().await.is_some() {} };
+        // Poll the workers inside the owning task so aborting it also drops all
+        // futures that could emit transcript updates for this recording.
+        tokio::join!(dispatch, transcribe);
 
         // Final verification with retry logic to catch any stragglers
         let mut verification_attempts = 0;

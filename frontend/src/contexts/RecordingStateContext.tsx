@@ -154,20 +154,18 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
           console.log('[RecordingStateContext] Recording stopped event:', payload);
           setState(prev => {
-            // Set status to STOPPING if not already in stop flow
-            // This ensures smooth UI transition for tray/keyboard stops
-            const newStatus = [
-              RecordingStatus.STOPPING,
-              RecordingStatus.PROCESSING_TRANSCRIPTS,
-              RecordingStatus.SAVING
-            ].includes(prev.status)
-              ? prev.status  // Already in stop flow
-              : RecordingStatus.STOPPING;  // New stop, transition smoothly
+            let status = RecordingStatus.IDLE;
+            let statusMessage: string | undefined;
+            if (payload.will_save !== false) {
+              const processing = [RecordingStatus.PROCESSING_TRANSCRIPTS, RecordingStatus.SAVING];
+              status = processing.includes(prev.status) ? prev.status : RecordingStatus.STOPPING;
+              statusMessage = status === RecordingStatus.STOPPING ? 'Stopping recording...' : prev.statusMessage;
+            }
 
             return {
               ...prev,
-              status: newStatus,
-              statusMessage: newStatus === RecordingStatus.STOPPING ? 'Stopping recording...' : prev.statusMessage,
+              status,
+              statusMessage,
               isRecording: false,
               isPaused: false,
               isActive: false,

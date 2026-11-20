@@ -6,64 +6,6 @@ use uuid::Uuid;
 
 pub struct TranscriptsRepository;
 
-#[cfg(test)]
-mod recording_save_replay_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn replay_keeps_one_meeting_and_its_complete_transcript() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-        let save_id = Uuid::new_v4();
-        let transcripts = ["First words", "Last words"].map(|text| TranscriptSegment {
-            id: text.into(),
-            text: text.into(),
-            timestamp: "[00:01]".into(),
-            audio_start_time: None,
-            audio_end_time: None,
-            duration: None,
-        });
-        let first = TranscriptsRepository::save_transcript(
-            &pool,
-            "Test call",
-            &transcripts,
-            None,
-            Some(save_id),
-        )
-        .await
-        .unwrap();
-        let replay = TranscriptsRepository::save_transcript(
-            &pool,
-            "Test call",
-            &transcripts,
-            None,
-            Some(save_id),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(first, replay);
-        let meeting_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let saved: Vec<String> = sqlx::query_scalar(
-            "SELECT transcript FROM transcripts WHERE meeting_id = ? ORDER BY transcript",
-        )
-        .bind(first)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(meeting_count, 1);
-        assert_eq!(saved, ["First words", "Last words"]);
-    }
-}
-
 impl TranscriptsRepository {
     /// Saves a new meeting and its associated transcript segments.
     /// This function uses a transaction to ensure that either both the meeting
@@ -73,9 +15,8 @@ impl TranscriptsRepository {
         meeting_title: &str,
         transcripts: &[TranscriptSegment],
         folder_path: Option<String>,
-        recording_save_id: Option<Uuid>,
     ) -> Result<String, SqlxError> {
-        let meeting_id = format!("meeting-{}", recording_save_id.unwrap_or_else(Uuid::new_v4));
+        let meeting_id = format!("meeting-{}", Uuid::new_v4());
 
         let mut conn = pool.acquire().await?;
         let mut transaction = conn.begin().await?;
@@ -83,9 +24,8 @@ impl TranscriptsRepository {
         let now = Utc::now();
 
         // 1. Create the new meeting
-        let inserted = sqlx::query(
-            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
-             VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+        let result = sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&meeting_id)
         .bind(meeting_title)
@@ -95,17 +35,10 @@ impl TranscriptsRepository {
         .execute(&mut *transaction)
         .await;
 
-        match inserted {
-            Ok(result) if result.rows_affected() == 0 => {
-                transaction.commit().await?;
-                return Ok(meeting_id);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                error!("Failed to create meeting '{}': {}", meeting_title, error);
-                transaction.rollback().await?;
-                return Err(error);
-            }
+        if let Err(e) = result {
+            error!("Failed to create meeting '{}': {}", meeting_title, e);
+            transaction.rollback().await?;
+            return Err(e);
         }
 
         info!("Successfully created meeting with id: {}", meeting_id);

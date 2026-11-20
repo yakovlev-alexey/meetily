@@ -1,8 +1,7 @@
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import type { Transcript } from '@/types';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
@@ -16,17 +15,14 @@ import {
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
-export interface RecordingSave {
-  session_id: string;
+export interface StoppedRecording {
+  session_id: number;
   folder_path: string | null;
   meeting_name: string | null;
-  transcripts: (Pick<Transcript, 'id' | 'text' | 'sequence_id' | 'audio_start_time' | 'audio_end_time' | 'duration' | 'confidence'> & {
-    display_time: string;
-  })[];
 }
 
 interface UseRecordingStopReturn {
-  handleRecordingStop: (callApi: boolean, recording?: RecordingSave) => Promise<void>;
+  handleRecordingStop: (callApi: boolean, recording?: StoppedRecording) => Promise<void>;
   isStopping: boolean;
   isProcessingTranscript: boolean;
   isSavingTranscript: boolean;
@@ -63,7 +59,7 @@ export function useRecordingStop(
   const {
     transcriptsRef,
     flushBuffer,
-    releaseRecordingTranscript,
+    clearTranscripts,
     meetingTitle,
     markMeetingAsSaved,
   } = useTranscripts();
@@ -78,11 +74,15 @@ export function useRecordingStop(
 
   const router = useRouter();
 
-  const handleRecordingStop = useCallback(async (isCallApi: boolean, recording?: RecordingSave) => {
-    if (!recording) {
-      setIsRecordingDisabled(false);
+  // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
+  const stopInProgressRef = useRef(false);
+
+  const handleRecordingStop = useCallback(async (isCallApi: boolean, recording?: StoppedRecording) => {
+    // Guard: prevent duplicate/concurrent stop calls
+    if (stopInProgressRef.current) {
       return;
     }
+    stopInProgressRef.current = true;
 
     // Set status to STOPPING immediately
     setStatus(RecordingStatus.STOPPING);
@@ -107,52 +107,55 @@ export function useRecordingStop(
       const MAX_WAIT_TIME = 60000; // 60 seconds maximum wait (increased for longer processing)
       const POLL_INTERVAL = 500; // Check every 500ms
       let elapsedTime = 0;
-      let transcriptionComplete = false;
+      // A claimed stop comes from the native shutdown path after transcription drains.
+      let transcriptionComplete = recording !== undefined;
 
-      // Listen for transcription-complete event
-      const unlistenComplete = await listen('transcription-complete', () => {
-        console.log('Received transcription-complete event');
-        transcriptionComplete = true;
-      });
+      if (!transcriptionComplete) {
+        // Listen for transcription-complete event
+        const unlistenComplete = await listen('transcription-complete', () => {
+          console.log('Received transcription-complete event');
+          transcriptionComplete = true;
+        });
 
-      // Poll for transcription status
-      while (elapsedTime < MAX_WAIT_TIME && !transcriptionComplete) {
-        try {
-          const status = await transcriptService.getTranscriptionStatus();
-          console.log('Transcription status:', status);
+        // Poll for transcription status
+        while (elapsedTime < MAX_WAIT_TIME && !transcriptionComplete) {
+          try {
+            const status = await transcriptService.getTranscriptionStatus();
+            console.log('Transcription status:', status);
 
-          // Check if transcription is complete
-          if (!status.is_processing && status.chunks_in_queue === 0) {
-            console.log('Transcription complete - no active processing and no chunks in queue');
-            transcriptionComplete = true;
+            // Check if transcription is complete
+            if (!status.is_processing && status.chunks_in_queue === 0) {
+              console.log('Transcription complete - no active processing and no chunks in queue');
+              transcriptionComplete = true;
+              break;
+            }
+
+            // If no activity for more than 8 seconds and no chunks in queue, consider it done (increased from 5s to 8s)
+            if (status.last_activity_ms > 8000 && status.chunks_in_queue === 0) {
+              console.log('Transcription likely complete - no recent activity and empty queue');
+              transcriptionComplete = true;
+              break;
+            }
+
+            // Update user with current status
+            if (status.chunks_in_queue > 0) {
+              console.log(`Processing ${status.chunks_in_queue} remaining audio chunks...`);
+              setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, `Processing ${status.chunks_in_queue} remaining chunks...`);
+            }
+
+            // Wait before next check
+            await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+            elapsedTime += POLL_INTERVAL;
+          } catch (error) {
+            console.error('Error checking transcription status:', error);
             break;
           }
-
-          // If no activity for more than 8 seconds and no chunks in queue, consider it done (increased from 5s to 8s)
-          if (status.last_activity_ms > 8000 && status.chunks_in_queue === 0) {
-            console.log('Transcription likely complete - no recent activity and empty queue');
-            transcriptionComplete = true;
-            break;
-          }
-
-          // Update user with current status
-          if (status.chunks_in_queue > 0) {
-            console.log(`Processing ${status.chunks_in_queue} remaining audio chunks...`);
-            setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, `Processing ${status.chunks_in_queue} remaining chunks...`);
-          }
-
-          // Wait before next check
-          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-          elapsedTime += POLL_INTERVAL;
-        } catch (error) {
-          console.error('Error checking transcription status:', error);
-          break;
         }
-      }
 
-      // Clean up listener
-      console.log('🧹 CLEANUP: Cleaning up transcription-complete listener');
-      unlistenComplete();
+        // Clean up listener
+        console.log('🧹 CLEANUP: Cleaning up transcription-complete listener');
+        unlistenComplete();
+      }
 
       if (!transcriptionComplete && elapsedTime >= MAX_WAIT_TIME) {
         console.warn('⏰ Transcription wait timeout reached after', elapsedTime, 'ms');
@@ -193,26 +196,10 @@ export function useRecordingStop(
         setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
 
         // Get fresh transcript state (ALL transcripts including late ones)
-        const transcriptsBySequence = new Map(recording.transcripts.map(({ display_time, ...segment }): [number | undefined, Transcript] => [
-          segment.sequence_id,
-          { ...segment, timestamp: display_time, is_partial: false }
-        ]));
-        const unsequencedTranscripts: Transcript[] = [];
-        for (const transcript of transcriptsRef.current) {
-          if (transcript.sequence_id === undefined) {
-            unsequencedTranscripts.push(transcript);
-          } else {
-            transcriptsBySequence.set(transcript.sequence_id, transcript);
-          }
-        }
-        const freshTranscripts = [...transcriptsBySequence.values(), ...unsequencedTranscripts];
-        freshTranscripts.sort((a, b) =>
-          (a.audio_start_time ?? a.chunk_start_time ?? 0) -
-          (b.audio_start_time ?? b.chunk_start_time ?? 0) ||
-          (a.sequence_id ?? 0) - (b.sequence_id ?? 0)
-        );
+        const freshTranscripts = [...transcriptsRef.current];
 
-        const { folder_path: folderPath, meeting_name: savedMeetingName } = recording;
+        const folderPath = recording?.folder_path ?? null;
+        const savedMeetingName = recording?.meeting_name;
 
         console.log('💾 Saving COMPLETE transcripts to database...', {
           transcript_count: freshTranscripts.length,
@@ -226,8 +213,7 @@ export function useRecordingStop(
           const responseData = await storageService.saveMeeting(
             savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
             freshTranscripts,
-            folderPath,
-            recording.session_id
+            folderPath
           );
 
           const meetingId = responseData.meeting_id;
@@ -267,6 +253,10 @@ export function useRecordingStop(
           // Mark meeting as saved in IndexedDB (for recovery system)
           await markMeetingAsSaved();
 
+          // Clean up session storage
+          // Clean up IndexedDB meeting ID (redundant with markMeetingAsSaved cleanup, but ensures cleanup)
+          sessionStorage.removeItem('indexeddb_current_meeting_id');
+
           // Refetch meetings and set current meeting
           await refetchMeetings();
 
@@ -301,64 +291,67 @@ export function useRecordingStop(
           });
 
           // Auto-navigate after a short delay with source parameter
-          await new Promise<void>(resolve => {
-            setTimeout(() => {
-              router.push(`/meeting-details?id=${meetingId}&source=recording`);
-              void Analytics.trackPageView('meeting_details');
-              setStatus(RecordingStatus.IDLE);
-              resolve();
-            }, 2000);
-          });
-          // Track meeting completion analytics
+          await new Promise<void>(resolve => setTimeout(resolve, 2000));
+          clearTranscripts();
+          setStatus(RecordingStatus.IDLE);
           try {
-            // Calculate meeting duration from transcript timestamps
-            let durationSeconds = 0;
-            if (freshTranscripts.length > 0 && freshTranscripts[0].audio_start_time !== undefined) {
-              // Use audio_end_time of last transcript if available
-              const lastTranscript = freshTranscripts[freshTranscripts.length - 1];
-              durationSeconds = lastTranscript.audio_end_time || lastTranscript.audio_start_time || 0;
-            }
-
-            // Calculate word count
-            const transcriptWordCount = freshTranscripts
-              .map(t => t.text.split(/\s+/).length)
-              .reduce((a, b) => a + b, 0);
-
-            // Calculate words per minute
-            const wordsPerMinute = durationSeconds > 0 ? transcriptWordCount / (durationSeconds / 60) : 0;
-
-            // Get meetings count today
-            const meetingsToday = await Analytics.getMeetingsCountToday();
-
-            // Track meeting completed
-            await Analytics.trackMeetingCompleted(meetingId, {
-              duration_seconds: durationSeconds,
-              transcript_segments: freshTranscripts.length,
-              transcript_word_count: transcriptWordCount,
-              words_per_minute: wordsPerMinute,
-              meetings_today: meetingsToday
-            });
-
-            // Update meeting count in analytics.json
-            await Analytics.updateMeetingCount();
-
-            // Check for activation (first meeting)
-            const { Store } = await import('@tauri-apps/plugin-store');
-            const store = await Store.load('analytics.json');
-            const totalMeetings = await store.get<number>('total_meetings');
-
-            if (totalMeetings === 1) {
-              const daysSinceInstall = await Analytics.calculateDaysSince('first_launch_date');
-              await Analytics.track('user_activated', {
-                meetings_count: '1',
-                days_since_install: daysSinceInstall?.toString() || 'null',
-                first_meeting_duration_seconds: durationSeconds.toString()
-              });
-            }
-          } catch (analyticsError) {
-            console.error('Failed to track meeting completion analytics:', analyticsError);
-            // Don't block user flow on analytics errors
+            router.push(`/meeting-details?id=${meetingId}&source=recording`);
+            void Analytics.trackPageView('meeting_details');
+          } catch (navigationError) {
+            console.error('Failed to open the saved meeting:', navigationError);
           }
+          // Track meeting completion analytics
+          const trackCompletion = async () => {
+            try {
+              // Calculate meeting duration from transcript timestamps
+              let durationSeconds = 0;
+              if (freshTranscripts.length > 0 && freshTranscripts[0].audio_start_time !== undefined) {
+                // Use audio_end_time of last transcript if available
+                const lastTranscript = freshTranscripts[freshTranscripts.length - 1];
+                durationSeconds = lastTranscript.audio_end_time || lastTranscript.audio_start_time || 0;
+              }
+
+              // Calculate word count
+              const transcriptWordCount = freshTranscripts
+                .map(t => t.text.split(/\s+/).length)
+                .reduce((a, b) => a + b, 0);
+
+              // Calculate words per minute
+              const wordsPerMinute = durationSeconds > 0 ? transcriptWordCount / (durationSeconds / 60) : 0;
+
+              // Get meetings count today
+              const meetingsToday = await Analytics.getMeetingsCountToday();
+
+              // Track meeting completed
+              await Analytics.trackMeetingCompleted(meetingId, {
+                duration_seconds: durationSeconds,
+                transcript_segments: freshTranscripts.length,
+                transcript_word_count: transcriptWordCount,
+                words_per_minute: wordsPerMinute,
+                meetings_today: meetingsToday
+              });
+
+              // Update meeting count in analytics.json
+              await Analytics.updateMeetingCount();
+
+              // Check for activation (first meeting)
+              const { Store } = await import('@tauri-apps/plugin-store');
+              const store = await Store.load('analytics.json');
+              const totalMeetings = await store.get<number>('total_meetings');
+
+              if (totalMeetings === 1) {
+                const daysSinceInstall = await Analytics.calculateDaysSince('first_launch_date');
+                await Analytics.track('user_activated', {
+                  meetings_count: '1',
+                  days_since_install: daysSinceInstall?.toString() || 'null',
+                  first_meeting_duration_seconds: durationSeconds.toString()
+                });
+              }
+            } catch (analyticsError) {
+              console.error('Failed to track meeting completion analytics:', analyticsError);
+            }
+          };
+          void trackCompletion();
 
         } catch (saveError) {
           console.error('Failed to save meeting to database:', saveError);
@@ -382,8 +375,8 @@ export function useRecordingStop(
       // isRecording already set to false at function start
       setIsRecordingDisabled(false);
     } finally {
-      // Keep failed recordings recoverable in IndexedDB while releasing the live buffer.
-      releaseRecordingTranscript();
+      // Always reset the guard flag when done
+      stopInProgressRef.current = false;
     }
   }, [
     setIsRecording,
@@ -391,7 +384,7 @@ export function useRecordingStop(
     setStatus,
     transcriptsRef,
     flushBuffer,
-    releaseRecordingTranscript,
+    clearTranscripts,
     meetingTitle,
     markMeetingAsSaved,
     refetchMeetings,

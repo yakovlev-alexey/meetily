@@ -181,6 +181,12 @@ impl MeetingCoordinator {
         }
     }
 
+    pub fn defer_start(&mut self) {
+        if matches!(self.state, State::AutoStarting { .. }) {
+            self.state = State::Idle;
+        }
+    }
+
     pub fn resolve_start(&mut self, session_id: Option<u64>) -> Result<(), &'static str> {
         let State::AutoStarting { provider_id, .. } = self.state.clone() else {
             return Err("no automatic start is pending");
@@ -197,6 +203,12 @@ impl MeetingCoordinator {
         };
 
         Ok(())
+    }
+
+    pub fn defer_stop(&mut self) {
+        if let State::AutoStopping { provider_id } = &self.state {
+            self.state = State::AutoRecording { provider_id: provider_id.clone() };
+        }
     }
 
     pub fn resolve_stop(&mut self, succeeded: bool) -> Result<(), &'static str> {

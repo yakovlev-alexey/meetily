@@ -40,25 +40,23 @@ export function MeetingDetectionSettings() {
 
     const load = async () => {
       try {
-        const [savedSettings, availableProviders, currentStatus] = await Promise.all([
+        const stopListening = await meetingDetectionService.watchStatus(nextStatus => {
+          if (mounted) setStatus(nextStatus);
+        });
+        if (!mounted) {
+          stopListening();
+          return;
+        }
+        unlisten = stopListening;
+
+        const [savedSettings, availableProviders] = await Promise.all([
           meetingDetectionService.getSettings(),
           meetingDetectionService.listProviders(),
-          meetingDetectionService.getStatus()
         ]);
 
         if (!mounted) return;
         setSettings(savedSettings);
         setProviders(availableProviders);
-        setStatus(currentStatus);
-
-        const stopListening = await meetingDetectionService.onStatusChanged(nextStatus => {
-          if (mounted) setStatus(nextStatus);
-        });
-        if (mounted) {
-          unlisten = stopListening;
-        } else {
-          stopListening();
-        }
       } catch (error) {
         console.error('Failed to load meeting detection settings:', error);
         toast.error('Failed to load meeting automation settings');

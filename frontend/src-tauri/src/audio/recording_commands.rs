@@ -10,8 +10,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::task::JoinHandle;
+use crate::meeting_detection::settings::{authorize_automation, AutomationAction, AutomationPermission};
 
 use super::{
     parse_audio_device,
@@ -37,15 +39,137 @@ pub use super::transcription::TranscriptUpdate;
 
 // Simple recording state tracking
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
-static RECORDING_LIFECYCLE_LOCK: tokio::sync::Mutex<Option<PendingRecordingSave>> =
-    tokio::sync::Mutex::const_new(None);
+static RECORDING_LIFECYCLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static NEXT_RECORDING_SESSION: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_RECORDING_SESSION: AtomicU64 = AtomicU64::new(0);
-static RECORDING_SAVE_CONSUMER: AtomicU64 = AtomicU64::new(0);
+const POST_PROCESSING_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const RECORDING_IS_SAVING: &str = "The previous recording is still being saved.";
+
+struct PostProcessingHold {
+    session_id: u64,
+    claimed: bool,
+}
+
+impl PostProcessingHold {
+    fn begin(&mut self, session_id: u64) -> bool {
+        if self.session_id != session_id || self.claimed {
+            return false;
+        }
+        self.claimed = true;
+        true
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct StoppedRecording {
+    session_id: u64,
+    folder_path: Option<String>,
+    meeting_name: Option<String>,
+}
+
+#[derive(Default)]
+struct RecordingPostProcessing {
+    hold: Option<PostProcessingHold>,
+    page_loading: bool,
+    document_id: u64,
+}
+
+impl RecordingPostProcessing {
+    fn set_page_loading(&mut self, loading: bool) {
+        self.page_loading = loading;
+        if loading {
+            // A new document has its own transcript buffer.
+            self.document_id += 1;
+            self.hold = None;
+        }
+    }
+
+    fn current_document(&self) -> Option<u64> {
+        (!self.page_loading).then_some(self.document_id)
+    }
+
+    fn offer(&mut self, session_id: u64, stopped_document: Option<u64>) -> bool {
+        if stopped_document.is_none() || stopped_document != self.current_document() {
+            return false;
+        }
+        self.hold = Some(PostProcessingHold { session_id, claimed: false });
+        true
+    }
+}
+
+static RECORDING_POST_PROCESSING: Mutex<RecordingPostProcessing> = Mutex::new(
+    RecordingPostProcessing { hold: None, page_loading: false, document_id: 0 },
+);
 
 pub(crate) fn active_recording_session() -> Option<u64> {
     let id = ACTIVE_RECORDING_SESSION.load(Ordering::SeqCst);
     (id != 0).then_some(id)
+}
+
+pub(crate) fn recording_start_ready() -> bool {
+    let processing = RECORDING_POST_PROCESSING.lock().unwrap();
+    !processing.page_loading && processing.hold.is_none()
+}
+
+pub(crate) fn recording_page_load(loading: bool) {
+    RECORDING_POST_PROCESSING.lock().unwrap().set_page_loading(loading);
+}
+
+#[tauri::command]
+pub fn begin_recording_post_processing(session_id: u64) -> bool {
+    let mut processing = RECORDING_POST_PROCESSING.lock().unwrap();
+    !processing.page_loading
+        && processing.hold.as_mut().is_some_and(|hold| hold.begin(session_id))
+}
+
+#[tauri::command]
+pub fn finish_recording_post_processing(session_id: u64) {
+    let mut processing = RECORDING_POST_PROCESSING.lock().unwrap();
+    if processing.hold.as_ref().is_some_and(|hold| hold.session_id == session_id) {
+        processing.hold = None;
+    }
+}
+
+fn post_processing_needs_delivery(session_id: u64) -> bool {
+    let processing = RECORDING_POST_PROCESSING.lock().unwrap();
+    processing.hold.as_ref().is_some_and(|hold| hold.session_id == session_id && !hold.claimed)
+}
+
+#[cfg(test)]
+mod recording_post_processing_tests {
+    use super::*;
+
+    #[test]
+    fn a_delayed_live_webview_can_still_claim_the_stopped_recording() {
+        RECORDING_POST_PROCESSING.lock().unwrap().hold = Some(PostProcessingHold {
+            session_id: 2,
+            claimed: false,
+        });
+        assert!(!recording_start_ready());
+        assert!(post_processing_needs_delivery(2));
+        assert!(!begin_recording_post_processing(1));
+        assert!(begin_recording_post_processing(2));
+        assert!(!begin_recording_post_processing(2));
+        assert!(!post_processing_needs_delivery(2));
+        assert!(!recording_start_ready());
+        finish_recording_post_processing(1);
+        assert!(!recording_start_ready());
+        finish_recording_post_processing(2);
+        assert!(recording_start_ready());
+    }
+
+    #[test]
+    fn a_stop_draining_during_reload_cannot_use_the_new_documents_buffer() {
+        let mut processing = RecordingPostProcessing::default();
+        let stopped_document = processing.current_document();
+        processing.set_page_loading(true);
+        processing.set_page_loading(false);
+        assert!(!processing.offer(1, stopped_document));
+        assert!(processing.hold.is_none());
+
+        assert!(processing.offer(2, processing.current_document()));
+        assert_eq!(processing.hold.unwrap().session_id, 2);
+    }
 }
 
 fn mark_recording_started() -> u64 {
@@ -55,16 +179,12 @@ fn mark_recording_started() -> u64 {
     id
 }
 
-pub(crate) fn recording_start_available() -> bool {
-    RECORDING_LIFECYCLE_LOCK.try_lock().is_ok_and(|pending| pending.is_none())
-}
-
-const SAVE_PENDING_MESSAGE: &str =
-    "The previous recording is still being saved. Wait for it to finish.";
-
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+// Listener ID for proper cleanup - prevents microphone from staying active after recording stops
+static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
 // ============================================================================
 // PUBLIC TYPES
@@ -73,83 +193,6 @@ static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 #[derive(Debug, Deserialize)]
 pub struct RecordingArgs {
     pub save_path: String,
-}
-
-#[derive(Clone, Serialize)]
-pub struct RecordingSave {
-    session_id: String,
-    folder_path: Option<String>,
-    meeting_name: Option<String>,
-    transcripts: Vec<super::recording_saver::TranscriptSegment>,
-}
-
-struct PendingRecordingSave {
-    recording: RecordingSave,
-    claimed_by: Option<u64>,
-}
-
-#[tauri::command]
-pub fn register_recording_save_consumer() -> u64 {
-    RECORDING_SAVE_CONSUMER.fetch_add(1, Ordering::SeqCst) + 1
-}
-
-#[tauri::command]
-pub async fn claim_pending_recording_save(consumer_id: u64) -> Option<RecordingSave> {
-    let mut lifecycle = RECORDING_LIFECYCLE_LOCK.lock().await;
-    lifecycle.as_mut()?.claim(consumer_id, RECORDING_SAVE_CONSUMER.load(Ordering::SeqCst))
-}
-
-#[tauri::command]
-pub async fn finish_recording_save(session_id: String, consumer_id: u64) {
-    let mut lifecycle = RECORDING_LIFECYCLE_LOCK.lock().await;
-    if lifecycle.as_ref().is_some_and(|pending| {
-        pending.can_finish(&session_id, consumer_id, RECORDING_SAVE_CONSUMER.load(Ordering::SeqCst))
-    }) {
-        *lifecycle = None;
-    }
-}
-
-impl PendingRecordingSave {
-    fn claim(&mut self, consumer_id: u64, current_consumer: u64) -> Option<RecordingSave> {
-        if consumer_id == 0 || consumer_id != current_consumer {
-            return None;
-        }
-        self.claimed_by = Some(consumer_id);
-        Some(self.recording.clone())
-    }
-
-    fn can_finish(&self, session_id: &str, consumer_id: u64, current_consumer: u64) -> bool {
-        self.claimed_by == Some(consumer_id)
-            && consumer_id == current_consumer
-            && self.recording.session_id == session_id
-    }
-}
-
-#[cfg(test)]
-mod recording_save_tests {
-    use super::*;
-
-    #[test]
-    fn pending_save_survives_retries_and_only_the_current_webview_can_finish_it() {
-        let mut pending = PendingRecordingSave {
-            recording: RecordingSave {
-                session_id: "12".into(),
-                folder_path: None,
-                meeting_name: None,
-                transcripts: Vec::new(),
-            },
-            claimed_by: None,
-        };
-
-        assert!(!pending.can_finish("12", 1, 1));
-        assert_eq!(pending.claim(1, 1).unwrap().session_id, "12");
-        assert_eq!(pending.claim(1, 1).unwrap().session_id, "12");
-        assert!(!pending.can_finish("12", 1, 2));
-        assert_eq!(pending.claim(2, 2).unwrap().session_id, "12");
-        assert!(pending.claim(1, 2).is_none());
-        assert!(!pending.can_finish("11", 2, 2));
-        assert!(pending.can_finish("12", 2, 2));
-    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -165,17 +208,18 @@ pub struct TranscriptionStatus {
 
 /// Start recording with default devices
 pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    start_recording_with_meeting_name(app, None).await.map(|_| ())
+    start_recording_with_meeting_name(app, None, None).await.map(|_| ())
 }
 
 /// Start recording with default devices and optional meeting name
-pub async fn start_recording_with_meeting_name<R: Runtime>(
+pub(crate) async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
+    automatic_start: Option<AutomationPermission<'_>>,
 ) -> Result<u64, String> {
     let _recording_guard = RECORDING_LIFECYCLE_LOCK.lock().await;
-    if _recording_guard.is_some() {
-        return Err(SAVE_PENDING_MESSAGE.into());
+    if !recording_start_ready() {
+        return Err(RECORDING_IS_SAVING.into());
     }
     info!(
         "Starting recording with default devices, meeting: {:?}",
@@ -335,12 +379,11 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     });
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
+    let permission = authorize_automation(automatic_start, AutomationAction::Start).await?;
     let transcription_receiver = manager
         .start_recording(microphone_device, system_device, auto_save)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
-
-    let transcript_writer = manager.transcript_writer();
 
     // Store the manager globally to keep it alive
     {
@@ -351,22 +394,58 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     let session_id = mark_recording_started();
+    drop(permission);
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
 
+    // CRITICAL: Listen for transcript-update events and save to recording manager
+    // This enables transcript history persistence for page reload sync
+    // Store listener ID for cleanup during stop_recording to ensure microphone is released
+    {
+        use tauri::Listener;
+        let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
+            // Parse the transcript update from the event payload
+            if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
+                // Create structured transcript segment
+                let segment = crate::audio::recording_saver::TranscriptSegment {
+                    id: format!("seg_{}", update.sequence_id),
+                    text: update.text.clone(),
+                    audio_start_time: update.audio_start_time,
+                    audio_end_time: update.audio_end_time,
+                    duration: update.duration,
+                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
+                    confidence: update.confidence,
+                    sequence_id: update.sequence_id,
+                };
+
+                // Save to recording manager
+                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
+                    if let Some(manager) = manager_guard.as_ref() {
+                        manager.add_transcript_segment(segment);
+                    }
+                }
+            }
+        });
+        let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
+        *global_listener = Some(listener_id);
+        info!("✅ Transcript-update event listener registered for history persistence");
+    }
+
+    // Emit success event
+    if let Err(error) = app.emit("recording-started", serde_json::json!({
+        "message": "Recording started successfully with parallel processing",
+        "devices": ["Default Microphone", "Default System Audio"],
+        "workers": 3
+    })) {
+        warn!("Failed to notify the frontend that recording started: {error}");
+    }
+
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver, transcript_writer);
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
     }
-
-    // Emit success event
-    app.emit("recording-started", serde_json::json!({
-        "message": "Recording started successfully with parallel processing",
-        "devices": ["Default Microphone", "Default System Audio"],
-        "workers": 3
-    })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -392,7 +471,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_session(app, mic_device_name, system_device_name, meeting_name)
+    start_recording_session(app, mic_device_name, system_device_name, meeting_name, None)
         .await
         .map(|_| ())
 }
@@ -402,10 +481,11 @@ pub(crate) async fn start_recording_session<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    automatic_start: Option<AutomationPermission<'_>>,
 ) -> Result<u64, String> {
     let _recording_guard = RECORDING_LIFECYCLE_LOCK.lock().await;
-    if _recording_guard.is_some() {
-        return Err(SAVE_PENDING_MESSAGE.into());
+    if !recording_start_ready() {
+        return Err(RECORDING_IS_SAVING.into());
     }
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
@@ -490,12 +570,11 @@ pub(crate) async fn start_recording_session<R: Runtime>(
     });
 
     // Start recording with specified devices and auto_save setting
+    let permission = authorize_automation(automatic_start, AutomationAction::Start).await?;
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
-
-    let transcript_writer = manager.transcript_writer();
 
     // Store the manager globally to keep it alive
     {
@@ -506,25 +585,61 @@ pub(crate) async fn start_recording_session<R: Runtime>(
     // Set recording flag and reset speech detection flag
     info!("🔍 Setting IS_RECORDING to true and resetting SPEECH_DETECTED_EMITTED");
     let session_id = mark_recording_started();
+    drop(permission);
     drop(engine_lifecycle_guard);
     reset_speech_detected_flag(); // Reset for new recording session
 
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver, transcript_writer);
+    // CRITICAL: Listen for transcript-update events and save to recording manager
+    // This enables transcript history persistence for page reload sync
+    // Store listener ID for cleanup during stop_recording to ensure microphone is released
     {
-        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
-        *global_task = Some(task_handle);
+        use tauri::Listener;
+        let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
+            // Parse the transcript update from the event payload
+            if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
+                // Create structured transcript segment
+                let segment = crate::audio::recording_saver::TranscriptSegment {
+                    id: format!("seg_{}", update.sequence_id),
+                    text: update.text.clone(),
+                    audio_start_time: update.audio_start_time,
+                    audio_end_time: update.audio_end_time,
+                    duration: update.duration,
+                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
+                    confidence: update.confidence,
+                    sequence_id: update.sequence_id,
+                };
+
+                // Save to recording manager
+                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
+                    if let Some(manager) = manager_guard.as_ref() {
+                        manager.add_transcript_segment(segment);
+                    }
+                }
+            }
+        });
+        let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
+        *global_listener = Some(listener_id);
+        info!("✅ Transcript-update event listener registered for history persistence");
     }
 
     // Emit success event
-    app.emit("recording-started", serde_json::json!({
+    if let Err(error) = app.emit("recording-started", serde_json::json!({
         "message": "Recording started with custom devices and parallel processing",
         "devices": [
             mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
             system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
         ],
         "workers": 3
-    })).map_err(|e| e.to_string())?;
+    })) {
+        warn!("Failed to notify the frontend that recording started: {error}");
+    }
+
+    // Start optimized parallel transcription task and store handle
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    {
+        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
+        *global_task = Some(task_handle);
+    }
 
     // Update tray menu to reflect recording state
     crate::tray::update_tray_menu(&app);
@@ -539,32 +654,51 @@ pub async fn stop_recording<R: Runtime>(
     app: AppHandle<R>,
     _args: RecordingArgs,
 ) -> Result<(), String> {
-    stop_recording_matching(app, None).await.map(|_| ())
+    stop_recording_matching(app, None, None).await.map(|_| ())
 }
 
 pub(crate) async fn stop_recording_matching<R: Runtime>(
     app: AppHandle<R>,
     expected_session: Option<u64>,
+    automatic_stop: Option<AutomationPermission<'_>>,
 ) -> Result<bool, String> {
     let Some(session_id) = expected_session.or_else(active_recording_session) else {
         return Ok(false);
     };
-    let mut lifecycle = RECORDING_LIFECYCLE_LOCK.lock().await;
+    let _recording_guard = RECORDING_LIFECYCLE_LOCK.lock().await;
     if active_recording_session() != Some(session_id) {
         return Ok(false);
     }
 
-    let recording = stop_active_recording(app.clone()).await?;
-    // Only the consumer of this session may release the shared transcript
-    // buffers. A slow save does not make them available to the next recording.
-    *lifecycle = Some(PendingRecordingSave { recording, claimed_by: None });
-    if let Err(error) = app.emit("recording-stop-complete", ()) {
-        error!("Failed to notify frontend about pending recording save: {error}");
+    let stopped_document = RECORDING_POST_PROCESSING.lock().unwrap().current_document();
+    let recording = stop_active_recording(app.clone(), session_id, stopped_document, automatic_stop).await?;
+    if !post_processing_needs_delivery(session_id) {
+        return Ok(true);
     }
+    if let Err(error) = app.emit("recording-stop-complete", &recording) {
+        warn!("Failed to notify the frontend that recording stopped: {error}");
+    }
+    // A hidden webview can suspend script delivery. Keep the current document's
+    // stop event available until its handler claims the transcript buffer.
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(POST_PROCESSING_RETRY_INTERVAL).await;
+            if !post_processing_needs_delivery(session_id) {
+                break;
+            }
+            let _ = app.emit("recording-stop-complete", &recording);
+        }
+    });
     Ok(true)
 }
 
-async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<RecordingSave, String> {
+async fn stop_active_recording<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: u64,
+    stopped_document: Option<u64>,
+    automatic_stop: Option<AutomationPermission<'_>>,
+) -> Result<StoppedRecording, String> {
+    let permission = authorize_automation(automatic_stop, AutomationAction::Stop).await?;
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
@@ -598,6 +732,7 @@ async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<Recordin
     };
 
     let (stop_result, manager_for_cleanup) = stop_result;
+    drop(permission);
 
     match stop_result {
         Ok(_) => {
@@ -606,6 +741,16 @@ async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<Recordin
         Err(e) => {
             error!("❌ Failed to stop audio streams: {}", e);
             return Err(format!("Failed to stop audio streams: {}", e));
+        }
+    }
+
+    // Step 1.5: Clean up transcript listener to release microphone
+    // Unlisten transcript-update event to prevent lingering references
+    {
+        use tauri::Listener;
+        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
+            app.unlisten(listener_id);
+            info!("✅ Transcript-update listener removed");
         }
     }
 
@@ -879,13 +1024,12 @@ async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<Recordin
     );
 
     // Perform final cleanup with the manager if available
-    let (meeting_folder, meeting_name, transcripts) = if let Some(mut manager) = manager_for_cleanup {
+    let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
         // Extract meeting info BEFORE async operations
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
-        let transcripts = manager.get_transcript_segments();
 
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
@@ -907,31 +1051,26 @@ async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<Recordin
             }
         }
 
-        (meeting_folder, meeting_name, transcripts)
+        (meeting_folder, meeting_name)
     } else {
         info!("ℹ️ No recording manager available for cleanup");
-        (None, None, Vec::new())
+        (None, None)
     };
 
     // Set recording flag to false
     info!("🔍 Setting IS_RECORDING to false");
+    let will_save = RECORDING_POST_PROCESSING.lock().unwrap().offer(session_id, stopped_document);
     ACTIVE_RECORDING_SESSION.store(0, Ordering::SeqCst);
     IS_RECORDING.store(false, Ordering::SeqCst);
 
     // Step 4.5: Prepare metadata for frontend (NO database save)
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.
     // This ensures the user sees all transcripts streaming in before the database save happens.
-    let (folder_path_str, meeting_name_str) = match (&meeting_folder, &meeting_name) {
-        (Some(path), Some(name)) => (
-            Some(path.to_string_lossy().to_string()),
-            Some(name.clone()),
-        ),
-        _ => (None, None),
+    let recording = StoppedRecording {
+        session_id,
+        folder_path: meeting_folder.map(|path| path.to_string_lossy().into_owned()),
+        meeting_name,
     };
-
-    info!("📤 Preparing recording metadata for frontend save");
-    info!("   folder_path: {:?}", folder_path_str);
-    info!("   meeting_name: {:?}", meeting_name_str);
 
     // Database save removed - frontend will handle this after receiving all transcripts
     info!("ℹ️ Skipping database save in Rust - frontend will save after all transcripts received");
@@ -946,28 +1085,21 @@ async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<Recordin
         }),
     );
 
-    // Emit final stop event with folder_path and meeting_name for frontend to save
+    // Other UI listeners still use the existing stop event.
     if let Err(error) = app.emit(
         "recording-stopped",
         serde_json::json!({
             "message": "Recording stopped - frontend will save after all transcripts received",
-            "folder_path": folder_path_str,
-            "meeting_name": meeting_name_str
+            "folder_path": &recording.folder_path,
+            "meeting_name": &recording.meeting_name,
+            "will_save": will_save,
         }),
     ) {
-        error!("Failed to emit recording-stopped: {error}");
+        warn!("Failed to publish recording state: {error}");
     }
 
-    // Update tray menu to reflect stopped state
     crate::tray::update_tray_menu(&app);
-
-    info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
-    Ok(RecordingSave {
-        session_id: uuid::Uuid::new_v4().to_string(),
-        folder_path: folder_path_str,
-        meeting_name: meeting_name_str,
-        transcripts,
-    })
+    Ok(recording)
 }
 
 /// Check if recording is active

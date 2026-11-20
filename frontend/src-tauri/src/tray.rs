@@ -1,8 +1,7 @@
 use tauri::{
-    Emitter,
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager, Runtime,
+    AppHandle, Emitter, Manager, Runtime,
 };
 
 #[derive(Debug, Clone)]
@@ -44,7 +43,7 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
         "settings" => {
             focus_main_window(app);
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.eval("window.location.assign('/settings')");
+                let _ = window.eval("window.dispatchEvent(new CustomEvent('open-settings-from-tray'))");
             }
         }
         "check_updates" => check_updates_handler(app),
@@ -82,7 +81,6 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             match stop_result {
                 Ok(_) => {
                     log::info!("Tray toggle: Recording stopped successfully");
-
                 }
                 Err(e) => {
                     log::error!("Tray toggle: Failed to stop recording: {}", e);
@@ -91,13 +89,12 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
                 }
             }
         } else {
-            // Immediately show starting state
-            set_tray_state(&app_clone, RecordingState::Starting);
-
-            log::info!("Emitting start recording event from tray");
-            if let Some(window) = app_clone.get_webview_window("main") {
-                let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
-                let _ = window.eval("window.location.assign('/')");
+            if !crate::audio::recording_commands::recording_start_ready() {
+                log::info!("Tray toggle: Waiting for the previous recording to be saved");
+                return;
+            }
+            if let Err(error) = app_clone.emit_to("main", "request-recording-toggle", ()) {
+                log::error!("Failed to request recording from tray: {error}");
             }
         }
     });
@@ -167,7 +164,6 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
         match stop_result {
             Ok(_) => {
                 log::info!("Tray: Recording stopped successfully");
-
             }
             Err(e) => {
                 log::error!("Tray: Failed to stop recording: {}", e);
