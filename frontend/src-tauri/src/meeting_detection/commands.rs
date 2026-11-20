@@ -9,13 +9,10 @@ use super::{
 #[tauri::command]
 pub async fn get_meeting_detection_settings(
     app: AppHandle<Wry>,
-    state: State<'_, MeetingDetectionMonitorState>,
 ) -> Result<MeetingDetectionSettings, String> {
-    let persisted_settings = settings::load_settings(&app)
+    settings::load_settings(&app)
         .await
-        .map_err(|error| format!("Failed to load meeting detection settings: {error}"))?;
-    state.update_settings(persisted_settings.clone()).await;
-    Ok(persisted_settings)
+        .map_err(|error| format!("Failed to load meeting detection settings: {error}"))
 }
 
 #[tauri::command]
@@ -24,11 +21,7 @@ pub async fn set_meeting_detection_settings(
     state: State<'_, MeetingDetectionMonitorState>,
     settings: MeetingDetectionSettings,
 ) -> Result<(), String> {
-    settings::save_settings(&app, &settings)
-        .await
-        .map_err(|error| format!("Failed to save meeting detection settings: {error}"))?;
-    state.update_settings(settings).await;
-    Ok(())
+    state.update_settings(&app, settings).await
 }
 
 #[tauri::command]

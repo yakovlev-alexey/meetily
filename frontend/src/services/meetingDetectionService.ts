@@ -50,6 +50,7 @@ export interface MeetingDetectionStatus {
   enabled: boolean;
   detected_provider_id: string | null;
   detected_provider_name: string | null;
+  telemost_signal: 'inactive' | 'active' | 'permission_required' | 'inactive_permission_required' | 'unavailable' | null;
   coordinator: MeetingDetectionCoordinatorStatus;
 }
 
@@ -70,12 +71,23 @@ export class MeetingDetectionService {
     return invoke<MeetingProviderDescriptor[]>('list_meeting_detection_providers');
   }
 
-  async onStatusChanged(
+  async watchStatus(
     callback: (status: MeetingDetectionStatus) => void
   ): Promise<UnlistenFn> {
-    return listen<MeetingDetectionStatus>('meeting-detection-status-changed', (event) => {
+    let eventCount = 0;
+    const unlisten = await listen<MeetingDetectionStatus>('meeting-detection-status-changed', (event) => {
+      eventCount += 1;
       callback(event.payload);
     });
+    const countAtRead = eventCount;
+    try {
+      const snapshot = await this.getStatus();
+      if (eventCount === countAtRead) callback(snapshot);
+      return unlisten;
+    } catch (error) {
+      unlisten();
+      throw error;
+    }
   }
 }
 

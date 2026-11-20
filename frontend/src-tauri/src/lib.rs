@@ -157,6 +157,15 @@ async fn start_recording<R: Runtime>(
 
 #[tauri::command]
 async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> Result<(), String> {
+    stop_recording_with_session(app, args, None, None).await
+}
+
+async fn stop_recording_with_session<R: Runtime>(
+    app: AppHandle<R>,
+    args: RecordingArgs,
+    expected_session: Option<u64>,
+    automatic_stop: Option<meeting_detection::settings::AutomationPermission<'_>>,
+) -> Result<(), String> {
     log_info!("Attempting to stop recording...");
 
     // Check the actual audio recording system state instead of the flag
@@ -166,15 +175,9 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
     }
 
     // Call the actual audio recording system to stop
-    match audio::recording_commands::stop_recording(
-        app.clone(),
-        audio::recording_commands::RecordingArgs {
-            save_path: args.save_path.clone(),
-        },
-    )
-    .await
-    {
-        Ok(_) => {
+    match audio::recording_commands::stop_recording_matching(app.clone(), expected_session, automatic_stop).await {
+        Ok(false) => Ok(()),
+        Ok(true) => {
             RECORDING_FLAG.store(false, Ordering::SeqCst);
             tray::update_tray_menu(&app);
 
@@ -209,6 +212,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
 
             Ok(())
         }
+        Err(e) if e == meeting_detection::settings::AUTOMATIC_STOP_DISABLED => Err(e),
         Err(e) => {
             log_error!("Failed to stop audio recording: {}", e);
             // Still update the flag even if stopping failed
@@ -324,6 +328,18 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
+    start_recording_with_devices_session(app, mic_device_name, system_device_name, meeting_name, None)
+        .await
+        .map(|_| ())
+}
+
+async fn start_recording_with_devices_session<R: Runtime>(
+    app: AppHandle<R>,
+    mic_device_name: Option<String>,
+    system_device_name: Option<String>,
+    meeting_name: Option<String>,
+    automatic_start: Option<meeting_detection::settings::AutomationPermission<'_>>,
+) -> Result<u64, String> {
     log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
 
@@ -337,8 +353,9 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 "No devices specified, starting with defaults and meeting: {:?}",
                 meeting_name
             );
-            audio::recording_commands::start_recording_with_meeting_name(app.clone(), meeting_name)
-                .await
+            audio::recording_commands::start_recording_with_meeting_name(
+                app.clone(), meeting_name, automatic_start,
+            ).await
         }
         _ => {
             log_info!(
@@ -347,18 +364,19 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 system_device_name,
                 meeting_name
             );
-            audio::recording_commands::start_recording_with_devices_and_meeting(
+            audio::recording_commands::start_recording_session(
                 app.clone(),
                 mic_device_name,
                 system_device_name,
                 meeting_name,
+                automatic_start,
             )
             .await
         }
     };
 
     match recording_result {
-        Ok(_) => {
+        Ok(session_id) => {
             log_info!("Recording started successfully via tauri command");
 
             // Show recording started notification through NotificationManager
@@ -377,7 +395,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 );
             }
 
-            Ok(())
+            Ok(session_id)
         }
         Err(e) => {
             log_error!("Failed to start recording via tauri command: {}", e);
@@ -537,6 +555,12 @@ pub fn run() {
 
             Ok(())
         })
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" {
+                let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
+                audio::recording_commands::recording_page_load(loading);
+            }
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -554,6 +578,8 @@ pub fn run() {
             stop_recording,
             is_recording,
             get_transcription_status,
+            audio::recording_commands::begin_recording_post_processing,
+            audio::recording_commands::finish_recording_post_processing,
             read_audio_file,
             save_transcript,
             analytics::commands::init_analytics,

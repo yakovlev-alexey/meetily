@@ -5,6 +5,7 @@
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
 use crate::audio::AudioChunk;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -76,7 +77,7 @@ pub fn start_transcription_task<R: Runtime>(
         info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
 
         // Spawn worker tasks
-        let mut worker_handles = Vec::new();
+        let mut workers = FuturesUnordered::new();
         for worker_id in 0..NUM_WORKERS {
             let engine_clone = match &transcription_engine {
                 TranscriptionEngine::Whisper(e) => TranscriptionEngine::Whisper(e.clone()),
@@ -89,7 +90,7 @@ pub fn start_transcription_task<R: Runtime>(
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
 
-            let worker_handle = tokio::spawn(async move {
+            workers.push(async move {
                 info!("👷 Worker {} started", worker_id);
 
                 // PRE-VALIDATE model state to avoid repeated async calls per chunk
@@ -317,46 +318,42 @@ pub fn start_transcription_task<R: Runtime>(
                 info!("👷 Worker {} completed", worker_id);
             });
 
-            worker_handles.push(worker_handle);
         }
 
-        // Main dispatcher: receive chunks and distribute to workers
-        let mut receiver = transcription_receiver;
-        while let Some(chunk) = receiver.recv().await {
-            let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
-            info!(
-                "📥 Dispatching chunk {} to workers (total queued: {})",
-                chunk.chunk_id, queued
-            );
+        let dispatch = async {
+            // Main dispatcher: receive chunks and distribute to workers
+            let mut receiver = transcription_receiver;
+            while let Some(chunk) = receiver.recv().await {
+                let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
+                info!(
+                    "📥 Dispatching chunk {} to workers (total queued: {})",
+                    chunk.chunk_id, queued
+                );
 
-            if let Err(_) = work_sender.send(chunk) {
-                error!("❌ Failed to send chunk to workers - this should not happen!");
-                break;
+                if let Err(_) = work_sender.send(chunk) {
+                    error!("❌ Failed to send chunk to workers - this should not happen!");
+                    break;
+                }
             }
-        }
 
-        // Signal that input is finished
-        input_finished.store(true, Ordering::SeqCst);
-        drop(work_sender); // Close the channel to signal workers
+            // Signal that input is finished
+            input_finished.store(true, Ordering::SeqCst);
+            drop(work_sender); // Close the channel to signal workers
 
-        let total_chunks_queued = chunks_queued.load(Ordering::SeqCst);
-        info!("📭 Input finished with {} total chunks queued. Waiting for all {} workers to complete...",
-              total_chunks_queued, NUM_WORKERS);
+            let total_chunks_queued = chunks_queued.load(Ordering::SeqCst);
+            info!("📭 Input finished with {} total chunks queued. Waiting for all {} workers to complete...",
+                  total_chunks_queued, NUM_WORKERS);
 
-        // Emit final chunk count to frontend
-        let _ = app.emit("transcription-queue-complete", serde_json::json!({
-            "total_chunks": total_chunks_queued,
-            "message": format!("{} chunks queued for processing - waiting for completion", total_chunks_queued)
-        }));
-
-        // Wait for all workers to complete
-        for (worker_id, handle) in worker_handles.into_iter().enumerate() {
-            if let Err(e) = handle.await {
-                error!("❌ Worker {} panicked: {:?}", worker_id, e);
-            } else {
-                info!("✅ Worker {} completed successfully", worker_id);
-            }
-        }
+            // Emit final chunk count to frontend
+            let _ = app.emit("transcription-queue-complete", serde_json::json!({
+                "total_chunks": total_chunks_queued,
+                "message": format!("{} chunks queued for processing - waiting for completion", total_chunks_queued)
+            }));
+        };
+        let transcribe = async { while workers.next().await.is_some() {} };
+        // Poll the workers inside the owning task so aborting it also drops all
+        // futures that could emit transcript updates for this recording.
+        tokio::join!(dispatch, transcribe);
 
         // Final verification with retry logic to catch any stragglers
         let mut verification_attempts = 0;

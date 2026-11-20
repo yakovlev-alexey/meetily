@@ -5,10 +5,52 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
+use tokio::sync::{RwLock, RwLockReadGuard};
 
 const STORE_FILE: &str = "meeting_detection_settings.json";
 const STORE_KEY: &str = "settings";
 const ZOOM_PROVIDER_ID: &str = "zoom";
+
+pub(crate) const AUTOMATIC_START_DISABLED: &str = "Automatic recording was disabled before capture.";
+pub(crate) const AUTOMATIC_STOP_DISABLED: &str = "Automatic recording was disabled before stopping.";
+
+pub(crate) enum AutomationAction {
+    Start,
+    Stop,
+}
+
+pub(crate) struct AutomationPermission<'a> {
+    pub settings: &'a RwLock<MeetingDetectionSettings>,
+    pub provider_id: &'a str,
+}
+
+impl<'a> AutomationPermission<'a> {
+    pub async fn authorize(
+        self,
+        action: AutomationAction,
+    ) -> Result<RwLockReadGuard<'a, MeetingDetectionSettings>, &'static str> {
+        let settings = self.settings.read().await;
+        let (enabled, denied) = match action {
+            AutomationAction::Start => (settings.auto_start, AUTOMATIC_START_DISABLED),
+            AutomationAction::Stop => (settings.auto_stop, AUTOMATIC_STOP_DISABLED),
+        };
+        if settings.enabled && enabled && settings.is_provider_enabled(self.provider_id) {
+            Ok(settings)
+        } else {
+            Err(denied)
+        }
+    }
+}
+
+pub(crate) async fn authorize_automation(
+    permission: Option<AutomationPermission<'_>>,
+    action: AutomationAction,
+) -> Result<Option<RwLockReadGuard<'_, MeetingDetectionSettings>>, String> {
+    match permission {
+        Some(permission) => permission.authorize(action).await.map(Some).map_err(str::to_owned),
+        None => Ok(None),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeetingDetectionSettings {
@@ -74,8 +116,16 @@ pub async fn save_settings<R: Runtime>(
     settings: &MeetingDetectionSettings,
 ) -> Result<()> {
     let store = app.store(STORE_FILE)?;
+    let previous = store.get(STORE_KEY);
     store.set(STORE_KEY, serde_json::to_value(settings)?);
-    store.save()?;
+    if let Err(error) = store.save() {
+        if let Some(previous) = previous {
+            store.set(STORE_KEY, previous);
+        } else {
+            store.delete(STORE_KEY);
+        }
+        return Err(error.into());
+    }
     info!("Meeting detection settings persisted");
     Ok(())
 }
@@ -91,6 +141,48 @@ fn default_enabled_providers() -> HashMap<String, bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_disable_during_startup_prevents_capture_authorization() {
+        let settings = RwLock::new(MeetingDetectionSettings {
+            enabled: true,
+            enabled_providers: HashMap::from([("telemost".into(), true)]),
+            ..MeetingDetectionSettings::default()
+        });
+        let start = AutomationPermission { settings: &settings, provider_id: "telemost" };
+        settings.write().await.enabled_providers.insert("telemost".into(), false);
+        assert!(matches!(start.authorize(AutomationAction::Start).await, Err(AUTOMATIC_START_DISABLED)));
+    }
+
+    #[tokio::test]
+    async fn settings_cannot_finish_updating_until_authorized_capture_finishes_opening() {
+        let settings = RwLock::new(MeetingDetectionSettings {
+            enabled: true,
+            ..MeetingDetectionSettings::default()
+        });
+        let capture = AutomationPermission { settings: &settings, provider_id: "zoom" };
+        let authorized = capture.authorize(AutomationAction::Start).await.unwrap();
+        assert!(settings.try_write().is_err());
+        drop(authorized);
+        let mut revision = settings.try_write().unwrap();
+        revision.auto_start = false;
+        drop(revision);
+        assert!(matches!(
+            (AutomationPermission { settings: &settings, provider_id: "zoom" }).authorize(AutomationAction::Start).await,
+            Err(AUTOMATIC_START_DISABLED)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_disable_before_stopping_prevents_stop_authorization() {
+        let settings = RwLock::new(MeetingDetectionSettings {
+            enabled: true,
+            ..MeetingDetectionSettings::default()
+        });
+        let stop = AutomationPermission { settings: &settings, provider_id: "zoom" };
+        settings.write().await.auto_stop = false;
+        assert!(matches!(stop.authorize(AutomationAction::Stop).await, Err(AUTOMATIC_STOP_DISABLED)));
+    }
 
     #[test]
     fn defaults_are_opt_in_but_ready_after_enablement() {
