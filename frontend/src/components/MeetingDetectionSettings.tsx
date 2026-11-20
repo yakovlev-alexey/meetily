@@ -199,7 +199,7 @@ export function MeetingDetectionSettings() {
                       ? `Supported on this device (${supportedPlatforms(provider)})`
                       : `Available on ${supportedPlatforms(provider)}`}
                   </div>
-                  {telemostSignal === 'permission_required' && (
+                  {(telemostSignal === 'permission_required' || telemostSignal === 'inactive_permission_required') && (
                     <div className="text-sm text-amber-800 mt-1">
                       Allow Meetily in System Settings → Privacy &amp; Security → Accessibility.
                     </div>

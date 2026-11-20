@@ -13,7 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, Wry};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    audio::recording_commands::active_recording_session,
+    audio::recording_commands::{active_recording_session, recording_start_available},
     notifications::commands::NotificationManagerState,
 };
 
@@ -146,8 +146,10 @@ impl MeetingDetectionMonitor {
                 && telemost_signal.is_some_and(TelemostSignal::is_unavailable);
             if release_telemost {
                 telemost_suppressed_until_inactive = true;
-            } else if telemost_signal.is_none() || telemost_signal == Some(TelemostSignal::Inactive)
-            {
+            } else if matches!(
+                telemost_signal,
+                None | Some(TelemostSignal::Inactive | TelemostSignal::InactivePermissionRequired)
+            ) {
                 telemost_suppressed_until_inactive = false;
             }
             let tracked_provider = tracked_provider.filter(|_| !release_telemost);
@@ -176,7 +178,7 @@ impl MeetingDetectionMonitor {
                 let mut coordinator = self.coordinator.lock().await;
                 coordinator.tick(CoordinatorInput {
                     enabled,
-                    auto_start: current_settings.auto_start,
+                    auto_start: current_settings.auto_start && recording_start_available(),
                     auto_stop: current_settings.auto_stop,
                     observation: observation.as_ref(),
                     recording_session: active_recording_session(),

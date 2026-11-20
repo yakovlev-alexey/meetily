@@ -41,10 +41,15 @@ pub fn read_signal() -> TelemostSignal {
     autoreleasepool(|| {
         let bundle_id = ns::String::with_str("ru.yandex.desktop.telemost");
         let applications = ns::RunningApp::with_bundle_id(&bundle_id);
+        let trusted = ax::is_process_trusted();
         if applications.is_empty() {
-            return TelemostSignal::Inactive;
+            return if trusted {
+                TelemostSignal::Inactive
+            } else {
+                TelemostSignal::InactivePermissionRequired
+            };
         }
-        if !ax::is_process_trusted() {
+        if !trusted {
             return TelemostSignal::PermissionRequired;
         }
         let mut unreadable = false;
@@ -150,6 +155,7 @@ mod tests {
         for signal in [
             TelemostSignal::Inactive,
             TelemostSignal::PermissionRequired,
+            TelemostSignal::InactivePermissionRequired,
             TelemostSignal::Unavailable,
         ] {
             context.telemost_signal = signal;

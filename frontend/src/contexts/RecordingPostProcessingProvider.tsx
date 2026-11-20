@@ -1,64 +1,53 @@
 'use client';
 
-import React, { useEffect } from 'react';
-import { emit, listen } from '@tauri-apps/api/event';
-import { useRecordingStop } from '@/hooks/useRecordingStop';
+import React, { useEffect, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { type RecordingSave, useRecordingStop } from '@/hooks/useRecordingStop';
 
-/**
- * RecordingPostProcessingProvider
- *
- * This provider handles post-processing when recording stops from any source:
- * - Tray menu stop
- * - Global keyboard shortcut
- * - Overlay stop button
- * - Main UI stop button
- *
- * It listens for the 'recording-stop-complete' event from Rust backend
- * and triggers the full post-processing flow (save to database, navigate, analytics)
- * regardless of which page the user is currently on.
- */
+const noop = () => {};
+
+// The backend queues one save for each successful stop, regardless of source.
 export function RecordingPostProcessingProvider({ children }: { children: React.ReactNode }) {
-  // No-op functions since the global RecordingStateContext already handles state updates
-  // These are only needed for the hook's local component state management
-  const setIsRecording = () => { };
-  const setIsRecordingDisabled = () => { };
-
-  const {
-    handleRecordingStop,
-  } = useRecordingStop(setIsRecording, setIsRecordingDisabled);
+  const { handleRecordingStop } = useRecordingStop(noop, noop);
+  const handler = useRef(handleRecordingStop);
+  useEffect(() => {
+    handler.current = handleRecordingStop;
+  }, [handleRecordingStop]);
 
   useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
 
-    const setupListener = async () => {
+    const processPendingSave = async () => {
+      if (disposed) return;
       try {
-        // Listen for recording-stop-complete event from Rust
-        unlistenFn = await listen<boolean | { automatic_session_id: string }>('recording-stop-complete', ({ payload }) => {
-          if (typeof payload === 'boolean') {
-            void handleRecordingStop(payload);
-            return;
-          }
-
-          void handleRecordingStop(true, true)
-            .finally(() => emit('automatic-recording-save-finished', payload.automatic_session_id))
-            .catch(error => console.error('Automatic recording post-processing failed:', error));
-        });
-
-        console.log('[RecordingPostProcessing] Event listener set up successfully');
+        const recording = await invoke<RecordingSave | null>('claim_pending_recording_save');
+        if (!recording) return;
+        await handler.current(true, recording);
+        await invoke('finish_recording_save', { sessionId: recording.session_id });
       } catch (error) {
-        console.error('[RecordingPostProcessing] Failed to set up event listener:', error);
+        console.error('Recording post-processing failed:', error);
       }
     };
 
-    setupListener();
+    void listen('recording-stop-complete', () => void processPendingSave())
+      .then(stopListening => {
+        if (disposed) {
+          stopListening();
+          return;
+        }
+        unlisten = stopListening;
+        // Pick up a stop that occurred before the webview listener attached.
+        void processPendingSave();
+      })
+      .catch(error => console.error('Failed to listen for a pending recording save:', error));
 
     return () => {
-      if (unlistenFn) {
-        console.log('[RecordingPostProcessing] Cleaning up event listener');
-        unlistenFn();
-      }
+      disposed = true;
+      unlisten?.();
     };
-  }, [handleRecordingStop]);
+  }, []);
 
   return <>{children}</>;
 }

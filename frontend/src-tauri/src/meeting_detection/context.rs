@@ -11,6 +11,7 @@ pub enum TelemostSignal {
     Inactive,
     Active,
     PermissionRequired,
+    InactivePermissionRequired,
     Unavailable,
 }
 

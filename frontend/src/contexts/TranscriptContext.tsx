@@ -18,6 +18,7 @@ interface TranscriptContextType {
   meetingTitle: string;
   setMeetingTitle: (title: string) => void;
   clearTranscripts: () => void;
+  releaseRecordingTranscript: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
 }
@@ -37,6 +38,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const isUserAtBottomRef = useRef<boolean>(true);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
   const finalFlushRef = useRef<(() => void) | null>(null);
+  const resetBufferRef = useRef<(() => void) | null>(null);
 
   // Keep ref updated with current transcripts
   useEffect(() => {
@@ -281,6 +283,11 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
     // Assign final flush function to ref for external access
     finalFlushRef.current = () => processBufferedTranscripts(true);
+    resetBufferRef.current = () => {
+      if (processingTimer) clearTimeout(processingTimer);
+      transcriptBuffer.clear();
+      lastProcessedSequence = 0;
+    };
 
     const setupListener = async () => {
       try {
@@ -347,6 +354,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
     return () => {
       console.log('🧹 CLEANUP: Cleaning up MAIN transcript listener...');
+      resetBufferRef.current = null;
       if (processingTimer) {
         clearTimeout(processingTimer);
         console.log('🧹 CLEANUP: Cleared processing timer');
@@ -486,6 +494,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
+  const releaseRecordingTranscript = useCallback(() => {
+    resetBufferRef.current?.();
+    transcriptsRef.current = [];
+    setTranscripts([]);
+    setCurrentMeetingId(null);
+    sessionStorage.removeItem('indexeddb_current_meeting_id');
+  }, []);
+
   // Mark current meeting as saved in IndexedDB
   const markMeetingAsSaved = useCallback(async () => {
     // Try context state first, fallback to sessionStorage
@@ -519,6 +535,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     meetingTitle,
     setMeetingTitle,
     clearTranscripts,
+    releaseRecordingTranscript,
     currentMeetingId,
     markMeetingAsSaved,
   };

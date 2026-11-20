@@ -157,7 +157,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       setIsProcessing(false);
       // Track successful transcription
       Analytics.trackTranscriptionSuccess();
-      onRecordingStop(true);
     } catch (error) {
       console.error('Failed to stop recording:', error);
       if (error instanceof Error) {
