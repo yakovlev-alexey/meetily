@@ -4,7 +4,10 @@
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
-use crate::audio::AudioChunk;
+use crate::audio::{
+    recording_saver::{RecordingTranscriptWriter, TranscriptSegment},
+    AudioChunk,
+};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,9 +45,10 @@ pub struct TranscriptUpdate {
 // have been moved to recording_commands.rs where they have access to RECORDING_MANAGER
 
 /// Optimized parallel transcription task ensuring ZERO chunk loss
-pub fn start_transcription_task<R: Runtime>(
+pub(crate) fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
     transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+    transcript_writer: RecordingTranscriptWriter,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
@@ -76,7 +80,7 @@ pub fn start_transcription_task<R: Runtime>(
         info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
 
         // Spawn worker tasks
-        let mut worker_handles = Vec::new();
+        let mut worker_handles = tokio::task::JoinSet::new();
         for worker_id in 0..NUM_WORKERS {
             let engine_clone = match &transcription_engine {
                 TranscriptionEngine::Whisper(e) => TranscriptionEngine::Whisper(e.clone()),
@@ -89,7 +93,8 @@ pub fn start_transcription_task<R: Runtime>(
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
 
-            let worker_handle = tokio::spawn(async move {
+            let transcript_writer = transcript_writer.clone();
+            worker_handles.spawn(async move {
                 info!("👷 Worker {} started", worker_id);
 
                 // PRE-VALIDATE model state to avoid repeated async calls per chunk
@@ -196,15 +201,6 @@ pub fn start_transcription_task<R: Runtime>(
                                         let audio_start_time = chunk_timestamp; // Already in seconds from recording start
                                         let audio_end_time = chunk_timestamp + chunk_duration;
 
-                                        // Save structured transcript segment to recording manager (only final results)
-                                        // Save ALL segments (partial and final) to ensure complete JSON
-                                        // Create structured segment with full timestamp data
-                                        // NOTE: This is now handled via the transcript-update event emission below
-                                        // The recording_commands module listens to these events and saves them
-                                        // This decouples the transcription worker from direct RECORDING_MANAGER access
-
-                                        // Emit transcript update with NEW recording-relative timestamps
-
                                         let update = TranscriptUpdate {
                                             text: transcript,
                                             timestamp: format_current_timestamp(), // Wall-clock for reference
@@ -218,6 +214,17 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_end_time,
                                             duration: chunk_duration,
                                         };
+
+                                        transcript_writer.add_transcript_segment(TranscriptSegment {
+                                            id: format!("seg_{}", update.sequence_id),
+                                            text: update.text.clone(),
+                                            audio_start_time: update.audio_start_time,
+                                            audio_end_time: update.audio_end_time,
+                                            duration: update.duration,
+                                            display_time: update.timestamp.clone(),
+                                            confidence: update.confidence,
+                                            sequence_id: update.sequence_id,
+                                        });
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
                                         {
@@ -317,7 +324,6 @@ pub fn start_transcription_task<R: Runtime>(
                 info!("👷 Worker {} completed", worker_id);
             });
 
-            worker_handles.push(worker_handle);
         }
 
         // Main dispatcher: receive chunks and distribute to workers
@@ -350,11 +356,9 @@ pub fn start_transcription_task<R: Runtime>(
         }));
 
         // Wait for all workers to complete
-        for (worker_id, handle) in worker_handles.into_iter().enumerate() {
-            if let Err(e) = handle.await {
-                error!("❌ Worker {} panicked: {:?}", worker_id, e);
-            } else {
-                info!("✅ Worker {} completed successfully", worker_id);
+        while let Some(result) = worker_handles.join_next().await {
+            if let Err(error) = result {
+                error!("Transcription worker failed: {error}");
             }
         }
 

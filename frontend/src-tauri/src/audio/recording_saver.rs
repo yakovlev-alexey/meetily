@@ -46,6 +46,72 @@ pub struct DeviceInfo {
     pub system_audio: Option<String>,
 }
 
+/// Session-scoped transcript writer shared with the worker during shutdown.
+#[derive(Clone)]
+pub(crate) struct RecordingTranscriptWriter {
+    transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
+    meeting_folder: Option<PathBuf>,
+}
+
+impl RecordingTranscriptWriter {
+    /// Add or update a structured transcript segment (upserts based on sequence_id)
+    /// Also saves incrementally to disk
+    pub(crate) fn add_transcript_segment(&self, segment: TranscriptSegment) {
+        if let Ok(mut segments) = self.transcript_segments.lock() {
+            // Check if segment with same sequence_id exists (update it)
+            if let Some(existing) = segments.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
+                *existing = segment.clone();
+                info!("Updated transcript segment {} (seq: {}) - total segments: {}",
+                      segment.id, segment.sequence_id, segments.len());
+            } else {
+                // New segment, add it
+                segments.push(segment.clone());
+                info!("Added new transcript segment {} (seq: {}) - total segments: {}",
+                      segment.id, segment.sequence_id, segments.len());
+            }
+        } else {
+            error!("Failed to lock transcript segments for adding segment {}", segment.id);
+        }
+
+        // NEW: Save incrementally to disk
+        if let Some(folder) = &self.meeting_folder {
+            if let Err(e) = RecordingSaver::write_transcripts_json(&self.transcript_segments, folder) {
+                warn!("Failed to write incremental transcript update: {}", e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_transcript_writer_tests {
+    use super::*;
+
+    #[test]
+    fn writer_keeps_segments_decoded_during_shutdown_in_the_same_recording() {
+        let saver = RecordingSaver::new();
+        let writer = saver.transcript_writer();
+        let segment = |sequence_id, text: &str| TranscriptSegment {
+            id: format!("seg_{sequence_id}"),
+            text: text.into(),
+            audio_start_time: sequence_id as f64,
+            audio_end_time: sequence_id as f64 + 1.0,
+            duration: 1.0,
+            display_time: "[00:01]".into(),
+            confidence: 1.0,
+            sequence_id,
+        };
+
+        writer.add_transcript_segment(segment(1, "Before stopping"));
+        let saver_taken_for_shutdown = saver;
+        writer.add_transcript_segment(segment(2, "Last words during the drain"));
+
+        let snapshot = saver_taken_for_shutdown.get_transcript_segments();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[1].text, "Last words during the drain");
+        assert!(RecordingSaver::new().get_transcript_segments().is_empty());
+    }
+}
+
 /// New recording saver using incremental saving strategy
 pub struct RecordingSaver {
     incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
@@ -91,31 +157,15 @@ impl RecordingSaver {
         }
     }
 
-    /// Add or update a structured transcript segment (upserts based on sequence_id)
-    /// Also saves incrementally to disk
-    pub fn add_transcript_segment(&self, segment: TranscriptSegment) {
-        if let Ok(mut segments) = self.transcript_segments.lock() {
-            // Check if segment with same sequence_id exists (update it)
-            if let Some(existing) = segments.iter_mut().find(|s| s.sequence_id == segment.sequence_id) {
-                *existing = segment.clone();
-                info!("Updated transcript segment {} (seq: {}) - total segments: {}",
-                      segment.id, segment.sequence_id, segments.len());
-            } else {
-                // New segment, add it
-                segments.push(segment.clone());
-                info!("Added new transcript segment {} (seq: {}) - total segments: {}",
-                      segment.id, segment.sequence_id, segments.len());
-            }
-        } else {
-            error!("Failed to lock transcript segments for adding segment {}", segment.id);
+    pub(crate) fn transcript_writer(&self) -> RecordingTranscriptWriter {
+        RecordingTranscriptWriter {
+            transcript_segments: self.transcript_segments.clone(),
+            meeting_folder: self.meeting_folder.clone(),
         }
+    }
 
-        // NEW: Save incrementally to disk
-        if let Some(folder) = &self.meeting_folder {
-            if let Err(e) = self.write_transcripts_json(folder) {
-                warn!("Failed to write incremental transcript update: {}", e);
-            }
-        }
+    pub fn add_transcript_segment(&self, segment: TranscriptSegment) {
+        self.transcript_writer().add_transcript_segment(segment);
     }
 
     /// Legacy method for backward compatibility - converts text to basic segment
@@ -283,9 +333,12 @@ impl RecordingSaver {
     }
 
     /// Write transcripts.json to disk (atomic write with temp file and validation)
-    fn write_transcripts_json(&self, folder: &PathBuf) -> Result<()> {
+    fn write_transcripts_json(
+        segments: &Mutex<Vec<TranscriptSegment>>,
+        folder: &std::path::Path,
+    ) -> Result<()> {
         // Clone segments to avoid holding lock during I/O
-        let segments_clone = if let Ok(segments) = self.transcript_segments.lock() {
+        let segments_clone = if let Ok(segments) = segments.lock() {
             segments.clone()
         } else {
             error!("Failed to lock transcript segments for writing");
@@ -399,7 +452,7 @@ impl RecordingSaver {
 
         // Save final transcripts.json with validation
         if let Some(folder) = &self.meeting_folder {
-            if let Err(e) = self.write_transcripts_json(folder) {
+            if let Err(e) = Self::write_transcripts_json(&self.transcript_segments, folder) {
                 error!("❌ Failed to write final transcripts: {}", e);
                 return Err(format!("Failed to save transcripts: {}", e));
             }

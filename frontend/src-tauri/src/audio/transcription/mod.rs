@@ -18,8 +18,8 @@ pub use engine::{
     get_or_init_transcription_engine,
     get_or_init_whisper
 };
+pub(crate) use worker::start_transcription_task;
 pub use worker::{
-    start_transcription_task,
     reset_speech_detected_flag,
     TranscriptUpdate
 };

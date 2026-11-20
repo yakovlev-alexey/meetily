@@ -41,6 +41,7 @@ static RECORDING_LIFECYCLE_LOCK: tokio::sync::Mutex<Option<PendingRecordingSave>
     tokio::sync::Mutex::const_new(None);
 static NEXT_RECORDING_SESSION: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_RECORDING_SESSION: AtomicU64 = AtomicU64::new(0);
+static RECORDING_SAVE_CONSUMER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn active_recording_session() -> Option<u64> {
     let id = ACTIVE_RECORDING_SESSION.load(Ordering::SeqCst);
@@ -59,14 +60,11 @@ pub(crate) fn recording_start_available() -> bool {
 }
 
 const SAVE_PENDING_MESSAGE: &str =
-    "The previous recording is still being saved. Wait for it to finish or restart Meetily to recover it.";
+    "The previous recording is still being saved. Wait for it to finish.";
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
-
-// Listener ID for proper cleanup - prevents microphone from staying active after recording stops
-static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
 // ============================================================================
 // PUBLIC TYPES
@@ -87,34 +85,43 @@ pub struct RecordingSave {
 
 struct PendingRecordingSave {
     recording: RecordingSave,
-    claimed: bool,
+    claimed_by: Option<u64>,
 }
 
 #[tauri::command]
-pub async fn claim_pending_recording_save() -> Option<RecordingSave> {
-    let mut lifecycle = RECORDING_LIFECYCLE_LOCK.lock().await;
-    lifecycle.as_mut()?.claim()
+pub fn register_recording_save_consumer() -> u64 {
+    RECORDING_SAVE_CONSUMER.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 #[tauri::command]
-pub async fn finish_recording_save(session_id: String) {
+pub async fn claim_pending_recording_save(consumer_id: u64) -> Option<RecordingSave> {
     let mut lifecycle = RECORDING_LIFECYCLE_LOCK.lock().await;
-    if lifecycle.as_ref().is_some_and(|pending| pending.can_finish(&session_id)) {
+    lifecycle.as_mut()?.claim(consumer_id, RECORDING_SAVE_CONSUMER.load(Ordering::SeqCst))
+}
+
+#[tauri::command]
+pub async fn finish_recording_save(session_id: String, consumer_id: u64) {
+    let mut lifecycle = RECORDING_LIFECYCLE_LOCK.lock().await;
+    if lifecycle.as_ref().is_some_and(|pending| {
+        pending.can_finish(&session_id, consumer_id, RECORDING_SAVE_CONSUMER.load(Ordering::SeqCst))
+    }) {
         *lifecycle = None;
     }
 }
 
 impl PendingRecordingSave {
-    fn claim(&mut self) -> Option<RecordingSave> {
-        if self.claimed {
+    fn claim(&mut self, consumer_id: u64, current_consumer: u64) -> Option<RecordingSave> {
+        if consumer_id == 0 || consumer_id != current_consumer {
             return None;
         }
-        self.claimed = true;
+        self.claimed_by = Some(consumer_id);
         Some(self.recording.clone())
     }
 
-    fn can_finish(&self, session_id: &str) -> bool {
-        self.claimed && self.recording.session_id == session_id
+    fn can_finish(&self, session_id: &str, consumer_id: u64, current_consumer: u64) -> bool {
+        self.claimed_by == Some(consumer_id)
+            && consumer_id == current_consumer
+            && self.recording.session_id == session_id
     }
 }
 
@@ -123,7 +130,7 @@ mod recording_save_tests {
     use super::*;
 
     #[test]
-    fn recording_save_can_be_claimed_once_and_finished_by_its_session() {
+    fn pending_save_survives_retries_and_only_the_current_webview_can_finish_it() {
         let mut pending = PendingRecordingSave {
             recording: RecordingSave {
                 session_id: "12".into(),
@@ -131,14 +138,17 @@ mod recording_save_tests {
                 meeting_name: None,
                 transcripts: Vec::new(),
             },
-            claimed: false,
+            claimed_by: None,
         };
 
-        assert!(!pending.can_finish("12"));
-        assert_eq!(pending.claim().unwrap().session_id, "12");
-        assert!(pending.claim().is_none());
-        assert!(!pending.can_finish("11"));
-        assert!(pending.can_finish("12"));
+        assert!(!pending.can_finish("12", 1, 1));
+        assert_eq!(pending.claim(1, 1).unwrap().session_id, "12");
+        assert_eq!(pending.claim(1, 1).unwrap().session_id, "12");
+        assert!(!pending.can_finish("12", 1, 2));
+        assert_eq!(pending.claim(2, 2).unwrap().session_id, "12");
+        assert!(pending.claim(1, 2).is_none());
+        assert!(!pending.can_finish("11", 2, 2));
+        assert!(pending.can_finish("12", 2, 2));
     }
 }
 
@@ -330,6 +340,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
+    let transcript_writer = manager.transcript_writer();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -343,43 +355,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver, transcript_writer);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
-    }
-
-    // CRITICAL: Listen for transcript-update events and save to recording manager
-    // This enables transcript history persistence for page reload sync
-    // Store listener ID for cleanup during stop_recording to ensure microphone is released
-    {
-        use tauri::Listener;
-        let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-            // Parse the transcript update from the event payload
-            if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                // Create structured transcript segment
-                let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
-                    text: update.text.clone(),
-                    audio_start_time: update.audio_start_time,
-                    audio_end_time: update.audio_end_time,
-                    duration: update.duration,
-                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
-                    confidence: update.confidence,
-                    sequence_id: update.sequence_id,
-                };
-
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
-                    }
-                }
-            }
-        });
-        let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
-        *global_listener = Some(listener_id);
-        info!("✅ Transcript-update event listener registered for history persistence");
     }
 
     // Emit success event
@@ -516,6 +495,8 @@ pub(crate) async fn start_recording_session<R: Runtime>(
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
+    let transcript_writer = manager.transcript_writer();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -529,43 +510,10 @@ pub(crate) async fn start_recording_session<R: Runtime>(
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver, transcript_writer);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
-    }
-
-    // CRITICAL: Listen for transcript-update events and save to recording manager
-    // This enables transcript history persistence for page reload sync
-    // Store listener ID for cleanup during stop_recording to ensure microphone is released
-    {
-        use tauri::Listener;
-        let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-            // Parse the transcript update from the event payload
-            if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                // Create structured transcript segment
-                let segment = crate::audio::recording_saver::TranscriptSegment {
-                    id: format!("seg_{}", update.sequence_id),
-                    text: update.text.clone(),
-                    audio_start_time: update.audio_start_time,
-                    audio_end_time: update.audio_end_time,
-                    duration: update.duration,
-                    display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
-                    confidence: update.confidence,
-                    sequence_id: update.sequence_id,
-                };
-
-                // Save to recording manager
-                if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                    if let Some(manager) = manager_guard.as_ref() {
-                        manager.add_transcript_segment(segment);
-                    }
-                }
-            }
-        });
-        let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
-        *global_listener = Some(listener_id);
-        info!("✅ Transcript-update event listener registered for history persistence");
     }
 
     // Emit success event
@@ -606,20 +554,17 @@ pub(crate) async fn stop_recording_matching<R: Runtime>(
         return Ok(false);
     }
 
-    let recording = stop_active_recording(app.clone(), session_id).await?;
+    let recording = stop_active_recording(app.clone()).await?;
     // Only the consumer of this session may release the shared transcript
     // buffers. A slow save does not make them available to the next recording.
-    *lifecycle = Some(PendingRecordingSave { recording, claimed: false });
+    *lifecycle = Some(PendingRecordingSave { recording, claimed_by: None });
     if let Err(error) = app.emit("recording-stop-complete", ()) {
         error!("Failed to notify frontend about pending recording save: {error}");
     }
     Ok(true)
 }
 
-async fn stop_active_recording<R: Runtime>(
-    app: AppHandle<R>,
-    session_id: u64,
-) -> Result<RecordingSave, String> {
+async fn stop_active_recording<R: Runtime>(app: AppHandle<R>) -> Result<RecordingSave, String> {
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
@@ -664,16 +609,6 @@ async fn stop_active_recording<R: Runtime>(
         }
     }
 
-    // Step 1.5: Clean up transcript listener to release microphone
-    // Unlisten transcript-update event to prevent lingering references
-    {
-        use tauri::Listener;
-        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
-            app.unlisten(listener_id);
-            info!("✅ Transcript-update listener removed");
-        }
-    }
-
     // Step 2: Signal transcription workers to finish processing ALL queued chunks
     let _ = app.emit(
         "recording-shutdown-progress",
@@ -690,7 +625,7 @@ async fn stop_active_recording<R: Runtime>(
         global_task.take()
     };
 
-    if let Some(task_handle) = transcription_task {
+    if let Some(mut task_handle) = transcription_task {
         info!("⏳ Waiting for ALL transcription chunks to be processed (no timeout - preserving every chunk)");
 
         // Enhanced progress monitoring during shutdown
@@ -719,7 +654,7 @@ async fn stop_active_recording<R: Runtime>(
         // Wait up to 10 minutes for transcription completion to prevent indefinite hangs
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(600), // 10 minutes max
-            task_handle
+            &mut task_handle
         ).await {
             Ok(Ok(())) => {
                 info!("✅ ALL transcription chunks processed successfully - no data lost");
@@ -730,7 +665,8 @@ async fn stop_active_recording<R: Runtime>(
             }
             Err(_) => {
                 warn!("⏱️ Transcription timeout (10 minutes) reached, continuing shutdown to prevent indefinite hang");
-                // Continue shutdown even on timeout - better to lose some chunks than hang forever
+                task_handle.abort();
+                let _ = task_handle.await;
             }
         }
 
@@ -1027,7 +963,7 @@ async fn stop_active_recording<R: Runtime>(
 
     info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
     Ok(RecordingSave {
-        session_id: session_id.to_string(),
+        session_id: uuid::Uuid::new_v4().to_string(),
         folder_path: folder_path_str,
         meeting_name: meeting_name_str,
         transcripts,

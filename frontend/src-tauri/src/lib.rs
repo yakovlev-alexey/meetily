@@ -565,6 +565,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
+            audio::recording_commands::register_recording_save_consumer,
             audio::recording_commands::claim_pending_recording_save,
             audio::recording_commands::finish_recording_save,
             is_recording,
