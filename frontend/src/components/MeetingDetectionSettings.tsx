@@ -40,25 +40,23 @@ export function MeetingDetectionSettings() {
 
     const load = async () => {
       try {
-        const [savedSettings, availableProviders, currentStatus] = await Promise.all([
+        const stopListening = await meetingDetectionService.watchStatus(nextStatus => {
+          if (mounted) setStatus(nextStatus);
+        });
+        if (!mounted) {
+          stopListening();
+          return;
+        }
+        unlisten = stopListening;
+
+        const [savedSettings, availableProviders] = await Promise.all([
           meetingDetectionService.getSettings(),
           meetingDetectionService.listProviders(),
-          meetingDetectionService.getStatus()
         ]);
 
         if (!mounted) return;
         setSettings(savedSettings);
         setProviders(availableProviders);
-        setStatus(currentStatus);
-
-        const stopListening = await meetingDetectionService.onStatusChanged(nextStatus => {
-          if (mounted) setStatus(nextStatus);
-        });
-        if (mounted) {
-          unlisten = stopListening;
-        } else {
-          stopListening();
-        }
       } catch (error) {
         console.error('Failed to load meeting detection settings:', error);
         toast.error('Failed to load meeting automation settings');
@@ -181,6 +179,9 @@ export function MeetingDetectionSettings() {
 
         {providers.map(provider => {
           const enabled = settings.enabled_providers[provider.id] ?? false;
+          const telemostSignal = provider.id === 'telemost' && settings.enabled && enabled
+            ? status?.telemost_signal
+            : null;
 
           return (
             <div
@@ -196,9 +197,20 @@ export function MeetingDetectionSettings() {
                       ? `Supported on this device (${supportedPlatforms(provider)})`
                       : `Available on ${supportedPlatforms(provider)}`}
                   </div>
+                  {(telemostSignal === 'permission_required' || telemostSignal === 'inactive_permission_required') && (
+                    <div className="text-sm text-amber-800 mt-1">
+                      Allow Meetily in System Settings → Privacy &amp; Security → Accessibility.
+                    </div>
+                  )}
+                  {telemostSignal === 'unavailable' && (
+                    <div className="text-sm text-amber-800 mt-1">
+                      Meetily cannot read the Telemost call state. You can stop recording manually.
+                    </div>
+                  )}
                 </div>
               </div>
               <Switch
+                aria-label={`Detect ${provider.display_name} meetings`}
                 checked={enabled}
                 onCheckedChange={providerEnabled => save({
                   ...settings,

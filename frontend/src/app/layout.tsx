@@ -2,6 +2,7 @@
 
 import './globals.css'
 import { Source_Sans_3 } from 'next/font/google'
+import { usePathname, useRouter } from 'next/navigation'
 import Sidebar from '@/components/Sidebar'
 import { SidebarProvider } from '@/components/Sidebar/SidebarProvider'
 import MainContent from '@/components/MainContent'
@@ -70,6 +71,8 @@ export default function RootLayout({
 }) {
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
+  const router = useRouter()
+  const pathname = usePathname()
 
   // Import audio state
   const [showDropOverlay, setShowDropOverlay] = useState(false)
@@ -98,6 +101,12 @@ export default function RootLayout({
       })
   }, [])
 
+  useEffect(() => {
+    const openSettings = () => router.push('/settings')
+    window.addEventListener('open-settings-from-tray', openSettings)
+    return () => window.removeEventListener('open-settings-from-tray', openSettings)
+  }, [router])
+
   // Disable context menu in production
   useEffect(() => {
     if (process.env.NODE_ENV === 'production') {
@@ -115,17 +124,18 @@ export default function RootLayout({
         toast.error("Please complete setup first", {
           description: "You need to finish onboarding before you can start recording."
         });
-      } else {
-        // If in main app, forward to useRecordingStart via window event
-        console.log('[Layout] Forwarding to start-recording-from-sidebar');
+      } else if (pathname === '/') {
         window.dispatchEvent(new CustomEvent('start-recording-from-sidebar'));
+      } else {
+        sessionStorage.setItem('autoStartRecording', 'true');
+        router.push('/');
       }
     });
 
     return () => {
       unlisten.then(fn => fn());
     };
-  }, [showOnboarding]);
+  }, [showOnboarding, pathname, router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {
